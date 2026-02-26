@@ -1,0 +1,6 @@
+ultralytics
+opencv-python
+numpy
+scikit-image
+scikit-learn
+scipy
