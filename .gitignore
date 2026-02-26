@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Jupyter Notebooks
+*.ipynb
+
+# VS Code
+.vscode/
+
+# Environment
+myenv/
+.env
+venv/
+ENV/
+
+# Data
+*.csv
+*.tsv
+*.dat
+*.npz
+*.npy
+*.h5
+*.sqlite
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.tif
+*.tiff
+
+# Models
+models/
+*.pt
+*.h5
+*.ckpt
+*.onnx
+
+# Misc
+*.log
+*.tmp
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ignore output
+output*
+
+# Ignore site-packages
+myenv/Lib/site-packages/
