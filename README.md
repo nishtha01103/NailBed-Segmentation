@@ -1,454 +1,290 @@
 # Nail Segmentation & Analysis Pipeline
 
-Multi-nail instance segmentation and analysis system using YOLOv8-seg for detecting, measuring, and analyzing fingernail characteristics.
+Real-time and static-image nail segmentation, geometry measurement, and color analysis using YOLOv8-seg. Designed for medical-grade nail morphology screening.
+
+---
 
 ## Project Overview
 
-This project detects multiple nails in images, segments them individually, and extracts:
-- **Geometric measurements** (length, width, area in pixels)
-- **Natural nail color** (LAB and BGR color space values)
-- Per-nail structured results for downstream analysis
+The system detects and segments individual fingernails from a webcam feed or a still image, then extracts:
 
-## Key Features
+- **Nail-bed geometry** � length, width, area (px and mm), shape ratio, free-edge boundary
+- **Full-nail geometry** � stabilized length/width from PCA, directional aspect ratio
+- **Color** � CIE LAB and BGR per nail, with SSR illumination normalization
+- **Texture** � ridge density, roughness, pitting (configurable sensitivity)
+- **Tilt detection** � rejects measurements when the finger is not flat to the camera
 
-✅ **Instance Segmentation**: Detects and segments multiple nails independently  
-✅ **Robust Color Extraction**: LAB-based color analysis with outlier removal  
-✅ **Accurate Measurements**: Rotated bounding box geometry for nail dimensions  
-✅ **Medical-Grade Lighting Correction**: Gray-world white balance normalization  
-✅ **CPU Optimized**: Efficient processing on CPU-only systems (Intel i5, 8GB RAM)  
-✅ **Production Ready**: Type hints, error handling, logging, configuration  
-✅ **Modular Design**: Clean separation of concerns across utility modules  
+Two operating modes share the same underlying analysis modules:
+
+| Mode | Entry point | Input |
+|------|------------|-------|
+| **Real-time** | `realtime.py` | Webcam |
+| **Static image** | `main.py` | JPEG / PNG |
+
+---
 
 ## Project Structure
 
 ```
 Nail_Segmentation/
-├── main.py                   # Entry point with error handling
-├── config.py                # Configuration and constants
-├── diagnostic.py            # Full segmentation diagnostics
-├── geometry_diagnostic.py   # Geometry validation diagnostics
-├── reference_measurements.py # Measurement reference calculator
-├── requirements.txt         # Python dependencies
-├── Context.md              # Project documentation
-├── README.md               # This file
-├── GEOMETRY_FIX.md         # Geometry validation guide
-├── IMPROVEMENTS.md         # Code quality improvements
-├── CALIBRATION.md          # Calibration documentation
-├── models/
-│   └── best.pt             # YOLOv8-seg trained model
-├── images/
-│   └── test_image.jpg      # Test input image
-└── src/
-    ├── __init__.py         # Package initialization
-    ├── analyze.py          # NailAnalyzer class (main pipeline)
-    ├── color_utils.py      # Color extraction with LAB space
-    ├── geometry_utils.py   # Geometric measurements with validation
-    └── calibration.py      # Real-world unit conversion
+ main.py                    # Entry point � static image analysis
+ realtime.py                # Entry point � live webcam analysis
+ config.py                  # All tuneable parameters
+ requirements.txt           # Python dependencies
+ README.md                  # This file
+ models/
+    best.pt                # YOLOv8-seg trained model
+ images/                    # Test images
+ src/
+     __init__.py
+     analyze.py             # NailAnalyzer class (static pipeline)
+     calibration.py         # Pixel  mm/cm conversion
+     color_utils.py         # CIE LAB extraction + SSR normalization
+     geometry_utils.py      # PCA geometry + nail-bed extraction facade
+     texture_analysis.py    # Ridge / roughness / pitting detection
+     geometry/              # Nail-bed boundary sub-pipeline
+         pipeline.py        # Orchestrates all geometry steps
+         boundary_detection.py   # BWC + gradient end selection
+         boundary_estimators.py  # Individual boundary methods
+         boundary_validation.py  # Multi-method voting & confidence
+         bed_mask_builder.py     # Nail-bed mask from accepted boundary
+         mask_processing.py      # Morphological helpers
+         pca_utils.py            # PCA axis / projection utilities
+         axis_orientation.py     # Anatomical axis correction
 ```
 
-## Installation & Setup
+---
 
-### 1. Create Virtual Environment
+## Installation
+
+### 1. Create and activate a virtual environment
 ```bash
 python -m venv myenv
-myenv\Scripts\activate  # Windows
-# or: source myenv/bin/activate  # macOS/Linux
+myenv\Scripts\activate          # Windows
+# source myenv/bin/activate     # macOS / Linux
 ```
 
-### 2. Install Dependencies
+### 2. Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Verify Setup
+### 3. Verify setup
 ```bash
 python main.py
 ```
 
-## Configuration
+---
 
-Edit `config.py` to adjust parameters:
+## Quick-start
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `MASK_THRESHOLD` | 0.5 | Binary threshold for mask conversion |
-| `MIN_MASK_PIXELS` | 1000 | Minimum nail size filter (pixels²) |
-| `LAB_L_MIN` | 40 | Shadow removal threshold |
-| `LAB_L_MAX` | 230 | Highlight removal threshold |
-| `LAB_A_OUTLIER_PERCENTILE` | 5 | Chromaticity outlier rejection (%) |
-| `LAB_B_OUTLIER_PERCENTILE` | 5 | Chromaticity outlier rejection (%) |
-| `NORMALIZE_WHITE_BALANCE` | True | Enable gray-world white balance normalization (medical) |
-| `DEFAULT_PIXELS_PER_MM` | 5.0 | Calibration factor (~200 DPI) |
-| `USE_AUTOMATIC_CALIBRATION` | False | Auto-estimate DPI from nail dimensions |
-| `INCLUDE_REAL_WORLD_MEASUREMENTS` | True | Add mm/cm values to output |
-| `LOG_LEVEL` | INFO | Logging verbosity (DEBUG, INFO, WARNING) |
-
-## Usage
-
-### Basic Usage
+### Static image
 ```python
 from src.analyze import NailAnalyzer
 
 analyzer = NailAnalyzer("models/best.pt")
-results = analyzer.analyze("images/test_image.jpg")
+results = analyzer.analyze("images/test.jpeg")
 
 for nail in results:
-    print(f"Nail {nail['nail_id']}:")
-    print(f"  Length: {nail['length_px']} px  |  {nail['length_mm']} mm  |  {nail['length_cm']} cm")
-    print(f"  Width: {nail['width_px']} px  |  {nail['width_mm']} mm  |  {nail['width_cm']} cm")
-    print(f"  Area: {nail['area_px']} px²  |  {nail['area_mm2']} mm²")
-    print(f"  LAB Color: {nail['nail_color_LAB']}")
-    print(f"  BGR Color: {nail['nail_color_BGR']}")
+    print(f"Nail {nail['nail_id']}")
+    print(f"  Length:      {nail['length_mm']:.1f} mm")
+    print(f"  Width:       {nail['width_mm']:.1f} mm")
+    print(f"  Area:        {nail['area_mm2']:.1f} mm")
+    print(f"  Shape ratio: {nail['nail_bed_aspect_ratio']:.2f}x")
+    print(f"  LAB:         {nail['nail_color_LAB']}")
 ```
 
-### With Custom Calibration
+### Real-time webcam
 ```python
-from src.analyze import NailAnalyzer
-from src.calibration import MeasurementCalibrator
+from realtime import RealtimeNailAnalyzer
 
-# Option 1: Set DPI directly
-calibrator = MeasurementCalibrator(pixels_per_mm=6.5)  # ~250 DPI
-analyzer = NailAnalyzer("models/best.pt", calibrator)
-
-# Option 2: Calibrate from reference object
-calibrator = MeasurementCalibrator()
-calibrator.set_calibration_from_reference(
-    reference_pixel_length=150,  # pixels
-    reference_real_length=30,    # mm
-)
-analyzer = NailAnalyzer("models/best.pt", calibrator)
-
-results = analyzer.analyze("images/test_image.jpg")
+analyzer = RealtimeNailAnalyzer("models/best.pt", pixels_per_mm=5.0)
+analyzer.run()   # opens webcam window; press Q to quit
 ```
-
-### With Error Handling
-```python
-try:
-    analyzer = NailAnalyzer("models/best.pt")
-    results = analyzer.analyze("path/to/image.jpg")
-except FileNotFoundError as e:
-    print(f"File error: {e}")
-except ValueError as e:
-    print(f"Invalid input: {e}")
-except RuntimeError as e:
-    print(f"Model error: {e}")
-```
-
-## Output Format
-
-Each nail is returned as a dictionary with pixel, relative, and real-world measurements:
-
-```python
-{
-    "nail_id": 1,
-    
-    # Pixel measurements
-    "length_px": 45.23,
-    "width_px": 28.15,
-    "area_px": 1089.42,
-    
-    # Relative measurements (dimensionless)
-    "aspect_ratio": 1.61,          # length/width ratio (1.2-3.0 expected)
-    "relative_size_percent": 0.08, # nail area as % of total image
-    
-    # Real-world measurements (mm)
-    "length_mm": 9.04,
-    "length_cm": 0.90,
-    "width_mm": 5.63,
-    "width_cm": 0.56,
-    "area_mm2": 43.58,
-    "area_cm2": 0.44,
-    
-    # Color information
-    "nail_color_LAB": [178.5, -2.1, 15.3],  # [L, a, b]
-    "nail_color_BGR": [180, 165, 140]
-}
-```
-
-**Note:** Real-world measurements (mm, cm, mm², cm²) are automatically calculated using the calibration factor. Adjust `DEFAULT_PIXELS_PER_MM` in `config.py` or provide a custom `MeasurementCalibrator` for accurate results.
-
-## Improvements Implemented
-
-### Code Quality
-- ✅ Type hints on all functions
-- ✅ Comprehensive docstrings
-- ✅ Proper package structure with `__init__.py`
-- ✅ Fixed relative import issues
-
-### Error Handling
-- ✅ File existence validation
-- ✅ Model loading error handling
-- ✅ Image reading error handling
-- ✅ Graceful failure for edge cases
-
-### Robustness
-- ✅ Parameterized thresholds in `config.py`
-- ✅ Outlier removal in color extraction (a, b chromaticity)
-- ✅ Minimum area validation
-- ✅ Pixel count validation
-
-### Logging & Debugging
-- ✅ Structured logging with timestamps
-- ✅ DEBUG level logs for skipped masks
-- ✅ INFO level logs for successful detections
-- ✅ WARNING level logs for color extraction failures
-
-### Color Extraction Enhancements
-- ✅ Median-based estimation (robust to outliers)
-- ✅ L channel filtering (shadow/highlight removal)
-- ✅ Percentile-based outlier removal on a, b channels
-- ✅ Minimum pixel count validation
-- ✅ Graceful failure if insufficient valid pixels
-- ✅ Gray-world white balance normalization (medical-grade lighting correction)
-
-### Geometry Measurement
-- ✅ Type hints for output
-- ✅ Minimum contour area validation
-- ✅ Proper float conversion
-- ✅ Clear length/width terminology
-
-### Real-World Measurement Calibration ✨ NEW
-- ✅ Automatic pixel-to-mm/cm conversion
-- ✅ Flexible calibration methods (DPI direct, reference object)
-- ✅ Support for automatic DPI estimation from nail size
-- ✅ Real-world area calculations (mm²)
-- ✅ Detailed calibration information (DPI, px/mm, px/cm)
-- ✅ Batch conversion for multiple nails
-
-## Performance Notes
-
-- **Model Loading**: ~1-2 seconds (first run)
-- **Image Inference**: ~2-3 seconds (CPU)
-- **Color Extraction**: O(n) where n = nail pixels
-- **Memory**: ~400MB for typical images
-
-## Geometry Validation (NEW)
-
-Before calibration, pixel measurements are validated to ensure they represent actual nails:
-
-### Validation Steps
-1. **Largest contour** - Filters noise and background
-2. **Aspect ratio check** - Ensures length/width is 1.2-3.0x (nail-like)
-3. **Minimum area** - Filters tiny noise regions
-
-### Check Your Geometry
-
-Run the geometry diagnostic to see which detections pass/fail:
-```bash
-python geometry_diagnostic.py images/test_image.jpg models/best.pt
-```
-
-Shows:
-- ✓ Which nails PASS validation
-- ❌ Which detections FAIL and why (aspect ratio, area, etc.)
-- Estimated DPI for each nail
-
-See [GEOMETRY_FIX.md](GEOMETRY_FIX.md) for detailed troubleshooting.
 
 ---
 
-## Measurement Calibration (mm/cm Conversion)
+## Output Fields
 
-Convert pixel measurements to real-world units using flexible calibration methods.
+Every detected nail is returned as a dictionary. The most medically relevant fields are:
 
-### How Calibration Works
+| Field | Type | Description |
+|-------|------|-------------|
+| `nail_id` | int | Detection index in the frame |
+| `shape_ratio` | float | **Primary ratio** � nail-bed length/width (nail-bed preferred; full-nail fallback) |
+| `aspect_ratio` | float | Full-nail length/width from stabilized PCA (debug reference) |
+| `length_mm` | float | Full-nail PCA length, stabilized over 7 frames |
+| `width_mm` | float | Full-nail PCA width, stabilized over 7 frames |
+| `area_mm2` | float | Full-nail area, stabilized over 5 frames (median) |
+| `nail_bed_length_mm` | float | Nail-bed length (free edge excluded) |
+| `nail_bed_width_mm` | float | Nail-bed width |
+| `nail_bed_area_mm2` | float | Nail-bed area |
+| `nail_bed_aspect_ratio` | float | Nail-bed length/width ratio |
+| `nail_bed_free_edge_present` | bool | Whether free edge was confidently detected |
+| `nail_bed_free_edge_confidence` | float | Confidence of free-edge detection (0�1) |
+| `boundary_methods_count` | int | Number of independent methods that agreed on the boundary |
+| `boundary_confidence` | float | Combined boundary detection confidence |
+| `nail_color_LAB` | list[float] | Median nail color [L, a, b] (OpenCV 0�255 scale) |
+| `nail_color_BGR` | list[int] | Median nail color [B, G, R] |
+| `nail_color_HEX` | str | Hex color string `#RRGGBB` |
+| `tilt_info` | dict | Tilt detection result (`likely_tilted`, `confidence`) |
+| `polished` | bool | True if nail appears polished (color analysis skipped) |
 
-The calibration factor (`pixels_per_mm`) converts pixel distances to physical units:
-- **200 DPI** ≈ 5.0 pixels/mm (default)
-- **300 DPI** ≈ 11.8 pixels/mm
-- **72 DPI** ≈ 2.83 pixels/mm
+---
 
-### Method 1: Default Calibration (Recommended for General Use)
+## Configuration (`config.py`)
+
+### Geometry
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MIN_NAIL_ASPECT_RATIO` | 0.40 | Minimum length/width (allows wide thumbs) |
+| `MAX_NAIL_ASPECT_RATIO` | 3.0 | Maximum length/width |
+| `MIN_NAIL_LENGTH_MM` | 3.0 | Reject detections < 3 mm |
+| `MAX_NAIL_LENGTH_MM` | 30.0 | Reject detections > 30 mm |
+| `MIN_NAIL_AREA_MM2` | 15.0 | Minimum nail plate area |
+| `MAX_NAIL_WIDTH_MM` | 22.0 | Rejects wide skin patches |
+| `NAIL_BED_NUM_SLICES` | 60 | Projection slices for boundary detection |
+
+### Real-time detection
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `REALTIME_DETECTION_CONFIDENCE` | 0.7 | YOLO confidence threshold |
+| `REALTIME_MASK_THRESHOLD` | 0.6 | Mask binarization threshold |
+| `REALTIME_MIN_MASK_PIXELS` | 2000 | Minimum mask size (px) |
+| `CENTROID_DISTANCE_THRESHOLD` | 100 | Max pixel distance for cross-frame nail matching |
+| `ASPECT_RATIO_SIMILARITY_THRESHOLD` | 0.3 | Max ratio difference for cross-frame matching |
+
+### Color & lighting
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ENABLE_RETINEX` | True | Single-Scale Retinex illumination normalization on L channel |
+| `RETINEX_SIGMA` | 30 | SSR Gaussian blur radius |
+| `NORMALIZE_WHITE_BALANCE` | False | Gray-world white balance (disabled � can desaturate) |
+| `LAB_L_MIN` | 40 | Shadow removal threshold |
+| `LAB_L_MAX` | 230 | Highlight removal threshold |
+
+### Calibration
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `DEFAULT_PIXELS_PER_MM` | 5.0 |  200 DPI; adjust for your camera |
+
+### Texture analysis
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ENABLE_TEXTURE_ANALYSIS` | True | Ridge / roughness / pitting detection |
+| `TEXTURE_SENSITIVITY` | `"conservative"` | `conservative` / `moderate` / `sensitive` |
+
+---
+
+## Calibration
+
+All measurements are converted from pixels using a `pixels_per_mm` factor.
+
+### Method 1: Set DPI directly
 ```python
-from src.analyze import NailAnalyzer
-
-# Uses default 200 DPI (~5.0 px/mm)
-# Adjust in config.py: DEFAULT_PIXELS_PER_MM
-analyzer = NailAnalyzer("models/best.pt")
-results = analyzer.analyze("image.jpg")
-# Results include: length_mm, length_cm, width_mm, width_cm, area_mm2
-```
-
-### Method 2: Custom DPI (When Camera Specs are Known)
-```python
-from src.analyze import NailAnalyzer
 from src.calibration import MeasurementCalibrator
-
-# Set calibration for 250 DPI camera
 calibrator = MeasurementCalibrator(pixels_per_mm=9.84)  # 250 DPI
-analyzer = NailAnalyzer("models/best.pt", calibrator)
-results = analyzer.analyze("image.jpg")
 ```
 
-### Method 3: Calibrate from Reference Object
-Most accurate method - measure a known object in the image:
+### Method 2: Calibrate from a reference object in the image
 ```python
-from src.analyze import NailAnalyzer
-from src.calibration import MeasurementCalibrator
-
 calibrator = MeasurementCalibrator()
-
-# If you have a 30mm ruler in the image that spans 150 pixels:
 calibrator.set_calibration_from_reference(
-    reference_pixel_length=150,  # pixels
-    reference_real_length=30,    # mm
+    reference_pixel_length=150,   # pixels in image
+    reference_real_length=30,     # mm in reality
 )
-
-# Or use centimeters:
-calibrator.set_calibration_from_reference(
-    reference_pixel_length=240,  # pixels
-    reference_real_length=10,    # cm
-    unit="cm"
-)
-
-analyzer = NailAnalyzer("models/best.pt", calibrator)
-results = analyzer.analyze("image.jpg")
 ```
 
-### Method 4: Automatic Calibration (Experimental)
-Auto-estimate DPI from nail size (assumes ~15mm average nail length):
-```python
-# In config.py, set:
-USE_AUTOMATIC_CALIBRATION = True
-TYPICAL_NAIL_LENGTH_MM = 15.0  # Adjust if needed
-
-analyzer = NailAnalyzer("models/best.pt")
-results = analyzer.analyze("image.jpg")
-# DPI is auto-estimated from first detected nail
-```
-
-### Get Calibration Information
-```python
-calibrator = analyzer.calibrator
-
-info = calibrator.get_calibration_info()
-print(f"DPI: {info['dpi']:.1f}")
-print(f"Pixels/mm: {info['pixels_per_mm']:.4f}")
-print(f"Pixels/cm: {info['pixels_per_cm']:.4f}")
-
-# Output: DPI: 200.0 | Pixels/mm: 5.0000 | Pixels/cm: 50.0000
-```
-
-### Conversion Functions
-```python
-from src.calibration import MeasurementCalibrator
-
-calibrator = MeasurementCalibrator(pixels_per_mm=5.0)
-
-# Direct conversions
-mm = calibrator.pixel_to_mm(100)      # 20.0 mm from 100 pixels
-cm = calibrator.pixel_to_cm(100)      # 2.0 cm from 100 pixels
-mm2 = calibrator.pixel_area_to_mm2(500)  # 20.0 mm² from 500 px²
-```
-
-### Tips for Accurate Calibration
-
-1. **Use the constant lighting** between calibration and image capture
-2. **Capture at consistent distance** from the camera
-3. **Use a measurement reference** (ruler, known object) if available
-4. **Test calibration accuracy** on multiple images
-5. **Adjust `DEFAULT_PIXELS_PER_MM`** in config.py based on your camera
-
-### Common DPI Values
+### Common reference values
 | Device | DPI | px/mm |
 |--------|-----|-------|
-| Smartphone (modern) | 300-450 | 11.8-17.7 |
-| Desktop camera | 72-100 | 2.8-3.9 |
-| High-res camera | 200-300 | 7.9-11.8 |
-| Default (config) | 200 | 5.0 |
+| Modern smartphone | 300�450 | 11.8�17.7 |
+| Webcam (720p�1080p) | 72�100 | 2.8�3.9 |
+| High-res DSLR | 200�300 | 7.9�11.8 |
+| Config default | 200 | 5.0 |
+
+---
+
+## Real-time Analyzer � Key Algorithms
+
+### Stable ratio policy
+`shape_ratio` always prefers nail-bed geometry when the free edge was confidently detected. When boundary detection fails it falls back to full-nail geometry, preventing measurement jumps between frames.
+
+### Temporal stabilization
+All per-nail measurements are smoothed over a rolling window keyed by a **40 px centroid grid** (stable across typical YOLO segmentation jitter):
+
+| Measurement | Window | Aggregation |
+|-------------|--------|-------------|
+| `length_px` | 7 frames | Mean with 15 % outlier gate |
+| `width_px` | 7 frames | Mean with 15 % outlier gate |
+| `area_px` | 5 frames | Median with 20 % outlier gate |
+| `boundary_proj` | 5 frames | Weighted median |
+| `free_edge_present` | 5 frames | Majority vote ( 3/5) |
+
+### Nail-bed boundary detection
+The boundary between nail bed and free edge is resolved by four independent estimators whose results are voted on. Boundary presence must remain stable for  3 of the last 5 frames before it is accepted. When no methods agree, or the boundary is absent, full-nail geometry is used as the safe fallback and nail-bed values are clamped to never exceed full-nail dimensions.
+
+**Distal end selection** (which end is the free edge):
+1. If bright-width coverage (BWC) differs by  0.12 between ends  use BWC score.
+2. If BWC is ambiguous and the gradient energy difference exceeds 0.08  use gradient energy.
+3. Otherwise  taper orientation (proximal end is wider).
+
+### Mask completeness check
+Before any expensive processing, the coverage of mask pixels along the PCA major axis relative to the rotated bounding box is checked. Masks with coverage < 0.60 are rejected as truncated detections.
+
+### ROI tracker
+After pose stabilization, a CSRT tracker follows the nail between YOLO inference frames, reducing latency and CPU load while keeping geometry locked.
 
 ---
 
 ## Troubleshooting
 
-### Diagnostic Tools
+### No nails detected
+- Lower `REALTIME_DETECTION_CONFIDENCE` (try 0.5�0.6).
+- Ensure the finger is flat, well-lit, and perpendicular to the camera.
+- Check `MIN_NAIL_ASPECT_RATIO` / `MAX_NAIL_ASPECT_RATIO` are not too strict.
 
-**Full Segmentation Diagnostics** - Image resolution, mask analysis, threshold effects:
-```bash
-python diagnostic.py images/test_image.jpg models/best.pt --save-masks
-# Creates debug_masks/ with visual overlays
-```
+### Same nail triggers "NEW NAIL DETECTED" repeatedly
+- Centroid jitter is exceeding the 40 px grid � keep the hand more still.
+- Check `CENTROID_DISTANCE_THRESHOLD` (default 100 px).
 
-**Geometry Validation Diagnostics** - Which detections pass/fail validation:
-```bash
-python geometry_diagnostic.py images/test_image.jpg models/best.pt
-# Shows aspect ratio, area, rejection reasons
-```
+### Measurements jump between frames
+- Likely free-edge detection is unstable. The 5-frame majority vote absorbs single-frame failures; if jumps persist, improve lighting and reduce `REALTIME_DETECTION_CONFIDENCE` to get cleaner masks.
+- Confirm `ENABLE_RETINEX = True` for consistent illumination.
 
-**Measurement Reference** - Estimate DPI and compare with expected values:
-```bash
-python reference_measurements.py
-# Shows expected pixel measurements at different DPI values
-```
+### Nail-bed ratio > full-nail ratio
+- Should not occur � safety clamps are applied after every boundary step.
+- Check `boundary_methods_count`: a value of 0 means the anatomical prior triggered the full-nail fallback.
 
-### Common Issues
+### Color returns None or nail is marked polished
+- Nail may be genuinely polished (`polished: True`) � color extraction is intentionally skipped.
+- If natural nails are wrongly classified, adjust `NAIL_LAB_*` color validation thresholds in `config.py`.
 
-#### "Model not found" error
-- Verify `models/best.pt` exists
-- Check path in `config.py` MODEL_PATH
+### Model not found
+- Verify `models/best.pt` exists.
+- Update `MODEL_PATH` in `config.py` if the model is stored elsewhere.
 
-#### "Failed to read image" error
-- Ensure image path is correct
-- Check image is valid JPG/PNG format
-
-#### No nails detected or very few nails
-- Run geometry diagnostic to see rejection reasons
-- If aspect ratio is the issue, adjust in `config.py`:
-  ```python
-  MIN_NAIL_ASPECT_RATIO = 1.0   # Lower from 1.2
-  MAX_NAIL_ASPECT_RATIO = 4.0   # Raise from 3.0
-  ```
-- If area is too small, adjust:
-  ```python
-  MIN_CONTOUR_AREA = 50  # Lower from 100
-  ```
-
-#### Measurements look too large (pixel values in 400+)
-- Check image resolution: `python diagnostic.py ...`
-- Likely image is very large (3000+ pixels)
-- Try downsampling image first or adjust `DEFAULT_PIXELS_PER_MM` in `config.py`
-- Use `reference_measurements.py` to estimate expected DPI
-
-#### Color extraction returns None
-- Image may have unusual lighting
-- Adjust `LAB_L_MIN`, `LAB_L_MAX` thresholds in `config.py`
-- Check nail is clearly defined in mask (`--save-masks`)
+---
 
 ## Dependencies
 
-- `ultralytics` - YOLOv8 framework
-- `opencv-python` - Image processing
-- `numpy` - Numerical operations
-- `scikit-image` - Additional image utilities
-- `scikit-learn` - Optional ML utilities
+```
+ultralytics       # YOLOv8 inference
+opencv-python     # Image processing, CSRT tracker
+numpy             # Numerical operations
+scipy             # Gaussian filter for boundary smoothing
+scikit-image      # Texture / image utilities
+scikit-learn      # Optional ML utilities
+```
+
+Install with:
+```bash
+pip install -r requirements.txt
+```
+
+---
 
 ## License & Attribution
 
-Built for nail segmentation and analysis research.
+Built for nail morphology research and medical screening.  
 Uses [YOLOv8](https://github.com/ultralytics/ultralytics) by Ultralytics.
-
-## Future Enhancements
-
-- [x] Real-world measurement calibration (mm/cm conversion) ✅ IMPLEMENTED
-- [ ] Nail health assessment metrics
-- [ ] Batch processing pipeline
-- [ ] GPU acceleration support
-- [ ] Web API interface
-- [ ] Visualization with annotated output
-
-<!-- Removed clinical interpretation details
-Removed L-value distribution details
-Removed pixel count
-Removed clinical assessment warnings 
-
-Next true professional upgrade would be:
-
-Disable webcam auto white balance
-
-Add gray reference calibration
-
-Add nail curvature detection
-
-Add temporal LAB averaging
-
-Add per-nail tracking across frames-->

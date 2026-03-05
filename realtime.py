@@ -84,6 +84,9 @@ class RealtimeNailAnalyzer:
         # --- Performance caches (Goals 1, 4, 5) ---
         # Goal 1: last raw YOLO masks; reused for the 2 frames between YOLO runs.
         self._cached_raw_masks = None
+        # Per-mask YOLO confidence (parallel to _cached_raw_masks).
+        # Applied as a per-mask floor on every frame, including cached ones.
+        self._cached_confs: np.ndarray = np.array([], dtype=np.float32)
         # Goal 4 & 5: per-nail measurement cache keyed by (snap_cx, snap_cy).
         # Stores last computed nail-bed values; reused when mask area changes < 10%.
         # This freezes the boundary projection on stable frames and avoids
@@ -108,26 +111,21 @@ class RealtimeNailAnalyzer:
         # keyed by the same centroid-snap key as the perf cache.
         self._length_history: dict = {}   # slot → deque(maxlen=7) of length_px values
         self._width_history: dict = {}    # slot → deque(maxlen=7) of width_px values
+        self._area_history: dict = {}     # slot → deque(maxlen=5) of area_px values
 
         # PERFORMANCE OPTIMIZATION: Pre-create morphology kernels (avoid repeated creation)
         self.kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         self.kernel_medium = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-        # Temporal consensus stabilization — per-slot (keyed by _cache_key).
-        # One deque per nail slot so multiple simultaneous nails don't mix
-        # measurements and corrupt each other's stability check.
-        # maxlen=8: we need 8 frames of evidence, not 20.
-        # No hard clear on instability — the window rolls naturally so a
-        # single bad frame (YOLO jitter) just drops off the back.
-        self._stability_windows: dict = {}   # slot → deque(maxlen=8)
-        self.is_stable = False   # most-recent per-slot stability (display only)
+        # Per-slot temporal consensus stabilization.
+        # One deque per nail slot so multiple nails never mix measurements.
+        # Rolling maxlen=8; no hard clear on failure so a single jittery
+        # YOLO frame falls off naturally instead of resetting the count.
+        self._stability_windows: dict = {}
+        self.is_stable = False
 
-        # Pose-lock stabilization — locked once the slot is declared stable.
-        # Thresholds are loosened to tolerate real YOLO mask variability:
-        #   centroid drift  ≤ 40 px  (was 20 — YOLO centroid jitters ±10-15 px)
-        #   area change     ≤ 20 %   (was 10 % — YOLO mask area varies ±15-20 %)
-        #   angle change    ≤ 15 °   (was  8 ° — moment angle noisy on near-square)
-        #   ratio change    ≤ 0.15   (was 0.08 — edge noise flips ratio easily)
+        # Pose-lock stabilization. Thresholds loosened for real YOLO jitter:
+        #   centroid <= 40 px, area <= 20 %, angle <= 15 deg, ratio <= 0.15
         self.pose_locked = False
         self.locked_pose = None
 
@@ -139,9 +137,16 @@ class RealtimeNailAnalyzer:
         self.tracker_active = False
         self.tracked_bbox = None
 
-        # Temporal mask fusion — accumulates recent full-frame binary masks and
-        # blends them via pixel-wise majority vote to suppress segmentation flicker.
-        self.mask_history: deque = deque(maxlen=5)
+        # Temporal mask fusion — per-slot deques keyed by centroid snap grid.
+        # Storing masks per slot prevents masks from different nails or frames
+        # being mixed into the same fusion window.
+        self._mask_history: dict = {}  # slot_key -> deque of binary masks
+
+        # Free-edge detection temporal stabilization.
+        # Requires boundary presence to persist across multiple frames before
+        # it is accepted, preventing single-frame detections from switching
+        # measurement mode and causing geometry jumps.
+        self._boundary_presence_history: dict = {}  # slot → deque(maxlen=5) of bool
         
     def is_valid_nail(self, nail_data: dict) -> bool:
         """Validate that detection is actually a nail (not fingers, glasses, skin, etc).
@@ -187,9 +192,13 @@ class RealtimeNailAnalyzer:
         # SHAPE-BASED FILTERING: Reject non-nail objects (fingers, glasses, etc.)
         mask = nail_data.get('mask')
         if mask is not None and mask.sum() > 0:
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                cnt = max(contours, key=cv2.contourArea)
+            # Reuse the contour already computed in process_frame(); only fall
+            # back to cv2.findContours if for some reason it is absent.
+            cnt = nail_data.get('contour')
+            if cnt is None:
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cnt = max(contours, key=cv2.contourArea) if contours else None
+            if cnt is not None:
                 area = cv2.contourArea(cnt)
                 perimeter = cv2.arcLength(cnt, True)
                 
@@ -238,16 +247,17 @@ class RealtimeNailAnalyzer:
                             logger.debug(f"Rejected: ellipse IoU {ell_iou:.2f} (not nail-shaped)")
                             return False
         
-        # Grayscale variance check — flat backgrounds / shadows have very
-        # low intensity variance; real nails have visible texture.
+        # Grayscale variance: real nails have a specular highlight giving
+        # std(gray) ~18-40. Flat skin patches are ~6-12.
+        # Floor raised 4.0->8.0 to reject skin; 8.0 not 12.0 to be safe.
         if mask is not None and mask.sum() > 0 and nail_data.get('_frame_ref') is not None:
             frame_ref = nail_data['_frame_ref']
             gray_frame = cv2.cvtColor(frame_ref, cv2.COLOR_BGR2GRAY)
             nail_pixels_gray = gray_frame[mask > 0]
             if len(nail_pixels_gray) > 30:
                 gray_std = float(np.std(nail_pixels_gray))
-                if gray_std < 4.0:
-                    logger.debug(f"Rejected: gray std {gray_std:.1f} (flat shadow/background)")
+                if gray_std < 8.0:
+                    logger.debug(f"Rejected: gray std {gray_std:.1f} < 8.0 (flat skin/shadow)")
                     return False
         
         # Check color is nail-like (not lips/skin/glasses)
@@ -355,15 +365,21 @@ class RealtimeNailAnalyzer:
         nail_L = L_channel[mask > 0]
         intensity_gradient = np.std(nail_L) if len(nail_L) > 0 else 0
         details['intensity_gradient'] = float(intensity_gradient)
-        if intensity_gradient > 15:
+        # Threshold raised 15->25: healthy nails routinely have std(L)~18-22
+        # from the natural specular highlight. Old threshold fired on real nails
+        # and combined with Check 1 gave score 0.50 -> false "tilted" rejection.
+        if intensity_gradient > 25:
             indicators.append("Perspective shading")
         
-        # Weighted indicator scoring
+        # Weighted indicator scoring.
+        # "Perspective shading" weight lowered 0.25->0.15.
+        # Normal nail max score: Check1(0.25) + Check5(0.15) = 0.40 < 0.50.
+        # Genuinely tilted nail triggers 3+ checks -> score >= 0.55.
         indicator_weights = {
             "High brightness variation": 0.25,
-            "Perspective shading": 0.25,
-            "Low circularity": 0.15,
-            "Extreme aspect ratio": 0.15,
+            "Perspective shading": 0.15,
+            "Low circularity": 0.20,
+            "Extreme aspect ratio": 0.20,
             "PCA vs bbox aspect mismatch": 0.15,
             "Irregular shape": 0.05,
         }
@@ -412,6 +428,9 @@ class RealtimeNailAnalyzer:
                 self.tracker_active = False
                 self.tracker = None
                 self.tracked_bbox = None
+                # Clear all per-slot mask histories so stale frames don't
+                # contaminate the fusion window after reacquisition.
+                self._mask_history.clear()
 
         # Dedicated inference frame — INTER_AREA minimises aliasing on downscale.
         # Created once per call regardless of whether YOLO runs this frame.
@@ -425,14 +444,21 @@ class RealtimeNailAnalyzer:
                     inference_frame,
                     conf=REALTIME_DETECTION_CONFIDENCE,
                     device="cpu",
-                    imgsz=480,
+                    imgsz=512,
                     verbose=False,
                     stream=False,
                 )[0]
                 if results.masks is not None:
                     self._cached_raw_masks = results.masks.data.cpu().numpy()
+                    if results.boxes is not None and results.boxes.conf is not None:
+                        self._cached_confs = results.boxes.conf.cpu().numpy()
+                    else:
+                        self._cached_confs = np.ones(
+                            len(self._cached_raw_masks), dtype=np.float32
+                        )
                 else:
                     self._cached_raw_masks = None
+                    self._cached_confs = np.array([], dtype=np.float32)
 
         nails = []
 
@@ -442,6 +468,17 @@ class RealtimeNailAnalyzer:
         masks = self._cached_raw_masks
         
         for i, mask in enumerate(masks):
+            # Per-mask confidence floor — applied every frame including cached ones.
+            # 0.75 sits above the 0.70 model gate but below where real nails land.
+            # (0.82 was too high and silently dropped valid detections.)
+            _MASK_CONF_FLOOR = 0.75
+            if (len(self._cached_confs) > i and
+                    float(self._cached_confs[i]) < _MASK_CONF_FLOOR):
+                logger.debug(
+                    f"Mask {i} dropped: conf={self._cached_confs[i]:.3f}"
+                    f" < floor {_MASK_CONF_FLOOR}"
+                )
+                continue
             # Resize mask to original frame size.
             # INTER_LINEAR gives smooth sub-pixel edges; threshold afterwards
             # avoids blocky staircase artefacts that destabilise PCA axes.
@@ -458,29 +495,36 @@ class RealtimeNailAnalyzer:
             if mask_binary.sum() < REALTIME_MIN_MASK_PIXELS:
                 continue
 
-            # ── Temporal mask fusion ───────────────────────────────────────
-            # Reduce frame-to-frame mask flicker caused by segmentation noise.
-            # Full-frame masks are accumulated in a short deque and then blended
-            # via a pixel-wise majority vote (>50% of frames must agree).
-            # Only applied when the tracker is actively following the nail; when
-            # YOLO just reacquired the nail the history is cleared so stale masks
-            # from a previous detection do not corrupt the new one.
-            if not _tracker_ok:
-                # Fresh YOLO detection — start history from scratch.
-                self.mask_history.clear()
+            # ── Per-slot temporal mask fusion ──────────────────────────────
+            # Reduce frame-to-frame mask flicker via pixel-wise majority vote.
+            # History is stored per nail slot so masks from different nails are
+            # never mixed.  A lightweight centroid key is derived directly from
+            # mask_binary here (same 20-px snap grid as _cache_key below).
+            _fuse_yx = np.argwhere(mask_binary == 255)
+            if len(_fuse_yx):
+                _fuse_key = (
+                    round(float(np.mean(_fuse_yx[:, 1])) / 20),
+                    round(float(np.mean(_fuse_yx[:, 0])) / 20),
+                )
+            else:
+                _fuse_key = None
 
-            self.mask_history.append(mask_binary.astype(np.uint8))
+            if not _tracker_ok and _fuse_key is not None:
+                # Fresh YOLO detection — clear this slot's history so stale
+                # masks from a previous detection don't contaminate the new one.
+                self._mask_history.pop(_fuse_key, None)
 
-            if _tracker_ok and len(self.mask_history) >= 3:
-                _mstack = np.stack(list(self.mask_history), axis=0).astype(np.float32)
-                # Normalise to [0,1] so the mean is a vote fraction.
-                _fused = (np.mean(_mstack, axis=0) > 127.5).astype(np.uint8) * 255
-                # Morphological close: fills small holes left by the vote.
-                # Reuse the pre-created 3×3 ellipse kernel to avoid allocation.
-                _fused = cv2.morphologyEx(_fused, cv2.MORPH_CLOSE, self.kernel_small)
-                if _fused.sum() >= REALTIME_MIN_MASK_PIXELS:
-                    mask_binary = _fused
-                # else: fused mask is too sparse — keep the raw mask
+            if _fuse_key is not None:
+                _mask_hist = self._mask_history.setdefault(_fuse_key, deque(maxlen=5))
+                _mask_hist.append(mask_binary)
+
+                if _tracker_ok and len(_mask_hist) >= 3:
+                    _mstack = np.stack(list(_mask_hist), axis=0).astype(np.float32) / 255.0
+                    _fused = (np.mean(_mstack, axis=0) > 0.5).astype(np.uint8) * 255
+                    _fused = cv2.morphologyEx(_fused, cv2.MORPH_CLOSE, self.kernel_small)
+                    if _fused.sum() >= REALTIME_MIN_MASK_PIXELS:
+                        mask_binary = _fused
+                    # else: fused mask too sparse — keep the raw mask
 
             # ── ROI cropping when tracker is active ─────────────────────────
             # When the CSRT tracker is following the nail, crop all
@@ -520,6 +564,10 @@ class RealtimeNailAnalyzer:
                         _work_frame = frame[_roi_y1:_roi_y2, _roi_x1:_roi_x2]
                         _work_lab   = lab_frame[_roi_y1:_roi_y2, _roi_x1:_roi_x2]
                         _work_mask  = _roi_crop_mask
+                        # Restrict mask_binary to the ROI so that all downstream
+                        # consumers (nail_data['mask'], is_valid_nail, etc.) operate
+                        # only on the tracked region and never see fused background.
+                        mask_binary = _roi_crop_mask
                         _using_roi  = True
 
             contours, _ = cv2.findContours(_work_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -558,7 +606,35 @@ class RealtimeNailAnalyzer:
             if not (MIN_NAIL_ASPECT_RATIO <= prelim_aspect_ratio <= MAX_NAIL_ASPECT_RATIO):
                 logger.debug(f"Early reject: aspect ratio {prelim_aspect_ratio:.2f} out of range")
                 continue
-            
+
+            # ── Mask completeness check ───────────────────────────────────────
+            # Reject truncated YOLO masks (e.g. nail only partially in frame or
+            # occluded) before any expensive computation.  Strategy:
+            #   1. Rotated bounding-box major span  (minAreaRect)
+            #   2. Mask projection span along PCA major axis
+            #   3. coverage = span_mask / span_bbox  — should be ≥ 0.60
+            # The PCA major axis is derived from the covariance matrix already
+            # computed above, so no extra pass over the data is required.
+            try:
+                _, (_bb_w, _bb_h), _ = cv2.minAreaRect(cnt)
+                _bbox_major_span = float(max(_bb_w, _bb_h))
+                if _bbox_major_span > 1e-6:
+                    # Eigen-decompose cov to get PCA major axis
+                    _evals, _evecs = np.linalg.eigh(cov)
+                    _major_axis_cov = _evecs[:, np.argmax(_evals)]  # (2,) unit vector
+                    _proj = nail_xy @ _major_axis_cov
+                    _mask_span = float(_proj.max() - _proj.min())
+                    _coverage = _mask_span / (_bbox_major_span + 1e-6)
+                    if _coverage < 0.60:
+                        logger.debug(
+                            f"Rejected nail {i+1}: truncated mask "
+                            f"coverage={_coverage:.2f} (<0.60)"
+                        )
+                        continue
+            except Exception as _mc_err:
+                logger.debug(f"Mask completeness check failed: {_mc_err}")
+                # Non-fatal: let the nail through if the check itself errors
+
             # Estimate out-of-plane tilt — pass pre-computed LAB to avoid re-conversion
             tilt_info = self.estimate_nail_tilt(_work_frame, _work_mask, lab_frame=_work_lab)
             
@@ -568,64 +644,53 @@ class RealtimeNailAnalyzer:
                 continue
             
             # --- Goals 4 & 5: Nail-bed boundary / PCA caching ---
-            # Compute a coarse centroid key (20-px grid) for cache lookup.
+            # Compute a coarse centroid key (40-px grid) for cache lookup.
+            # A 40 px grid tolerates typical YOLO centroid jitter (~5-15 px)
+            # while still distinguishing adjacent nails (~80+ px apart at normal
+            # camera distances), so the same physical nail always maps to the
+            # same slot across frames.
+            _GRID_SIZE = 40
             _cx = float(centroid[0])
             _cy = float(centroid[1])
-            _cache_key = (round(_cx / 20), round(_cy / 20))
+            _cache_key = (round(_cx / _GRID_SIZE), round(_cy / _GRID_SIZE))
 
-            # ── Per-slot temporal consensus stabilization ─────────────────────
-            # Each nail slot has its own deque so multiple simultaneous nails
-            # never contaminate each other's stability check.
-            # Rolling window (maxlen=8): a single bad frame just falls off
-            # naturally — no hard clear that resets to zero.
-            # Stability is declared when ≥ 6 of the last 8 frames pass all
-            # three metric checks (75% vote), tolerating YOLO mask jitter.
+            # Per-slot temporal consensus stabilization.
+            # Each nail slot has its own deque (maxlen=8). Stability passes
+            # when >= 6 of the last 8 frames are within bounds (75% vote).
+            # No hard clear — a bad frame just rolls off naturally.
             measurement = {
-                "cx":    _cx,
-                "cy":    _cy,
-                "area":  area_px,
-                "ratio": prelim_aspect_ratio,
+                "cx": _cx, "cy": _cy, "area": area_px, "ratio": prelim_aspect_ratio,
             }
             _stab_win = self._stability_windows.setdefault(
                 _cache_key, deque(maxlen=8)
             )
             _stab_win.append(measurement)
 
-            # Loosened thresholds calibrated to real YOLO + webcam variability:
-            #   centroid_motion: range of centroids across window (x-span + y-span)
-            #     25 was too tight → YOLO centroid jitter alone spans ~20-30 px
-            #   area_change: (max-min)/max across window
-            #     0.15 was too tight → YOLO mask area varies ±15-20 %
-            #   ratio_change: max-min across window
-            #     0.10 was too tight → small mask edges easily flip ratio by 0.15
-            _CENTROID_THR = 50
-            _AREA_THR     = 0.25
-            _RATIO_THR    = 0.20
-            _MIN_STABLE_FRAMES = 6   # of 8 must pass (75 % vote)
+            _CENTROID_THR = 50   # px deviation from median (was 25 — too tight)
+            _AREA_THR     = 0.25  # fraction (was 0.15)
+            _RATIO_THR    = 0.20  # (was 0.10)
+            _MIN_STABLE   = 6    # of 8 frames must pass (75% vote)
 
             if len(_stab_win) >= 8:
                 _cx_v = [m["cx"]    for m in _stab_win]
                 _cy_v = [m["cy"]    for m in _stab_win]
                 _ar_v = [m["area"]  for m in _stab_win]
                 _rt_v = [m["ratio"] for m in _stab_win]
-
-                # Per-frame pass/fail (compare each frame to window median)
-                _cx_med  = float(np.median(_cx_v))
-                _cy_med  = float(np.median(_cy_v))
-                _ar_med  = float(np.median(_ar_v))
-                _rt_med  = float(np.median(_rt_v))
+                _cx_med = float(np.median(_cx_v))
+                _cy_med = float(np.median(_cy_v))
+                _ar_med = float(np.median(_ar_v))
+                _rt_med = float(np.median(_rt_v))
                 _passing = sum(
                     1 for m in _stab_win
-                    if (abs(m["cx"]    - _cx_med) + abs(m["cy"] - _cy_med)) < _CENTROID_THR
+                    if (abs(m["cx"] - _cx_med) + abs(m["cy"] - _cy_med)) < _CENTROID_THR
                     and abs(m["area"]  - _ar_med) / max(_ar_med, 1) < _AREA_THR
                     and abs(m["ratio"] - _rt_med) < _RATIO_THR
                 )
-                if _passing >= _MIN_STABLE_FRAMES:
+                if _passing >= _MIN_STABLE:
                     self.is_stable = True
                 else:
                     self.is_stable = False
-                    # Do NOT clear the window — let it roll.  Only break pose lock
-                    # so that the print-gate confidence will naturally drop.
+                    # Do NOT clear the window — let it roll.
                     self.pose_locked = False
                     self.locked_pose = None
                     self.tracker_active = False
@@ -644,8 +709,9 @@ class RealtimeNailAnalyzer:
             # 15 % of the median are silently dropped; the stabilized output then
             # falls back to the current history mean, keeping continuity.
             if _cache_key is not None:
-                _len_hist = self._length_history.setdefault(_cache_key, deque(maxlen=7))
-                _wid_hist = self._width_history.setdefault(_cache_key, deque(maxlen=7))
+                _len_hist  = self._length_history.setdefault(_cache_key, deque(maxlen=7))
+                _wid_hist  = self._width_history.setdefault(_cache_key, deque(maxlen=7))
+                _area_hist = self._area_history.setdefault(_cache_key, deque(maxlen=5))
 
                 # Length outlier check
                 if len(_len_hist) > 0:
@@ -665,11 +731,23 @@ class RealtimeNailAnalyzer:
                 else:
                     _wid_hist.append(width_px)   # buffer empty: always seed
 
+                # Area outlier check (20 % threshold — area variance is larger than
+                # linear dimensions because it scales with the square of the span).
+                if len(_area_hist) > 0:
+                    _median_area = float(np.median(_area_hist))
+                    if abs(area_px - _median_area) <= 0.20 * _median_area:
+                        _area_hist.append(area_px)
+                    # else: corrupted frame — skip append, reuse existing history
+                else:
+                    _area_hist.append(area_px)   # buffer empty: always seed
+
                 length_stable = float(np.mean(_len_hist))
                 width_stable  = float(np.mean(_wid_hist))
+                area_stable   = float(np.median(_area_hist))
             else:
                 length_stable = length_px
                 width_stable  = width_px
+                area_stable   = float(area_px)
 
             # Nail orientation from second-order central moments (fast, no extra OpenCV call).
             # Used by texture analysis for orientation-aware ridge detection.
@@ -714,10 +792,10 @@ class RealtimeNailAnalyzer:
                 else:
                     _pose_angle_diff = 0.0  # can't check angle — pass
 
-                _pose_centroid_thr = 40      # was 20 — YOLO centroid jitters ±10-15 px
-                _pose_angle_thr    = np.deg2rad(15)  # was 8° — moment angle noisy
-                _pose_area_thr     = 0.20    # was 0.10 — YOLO mask area varies ±15-20 %
-                _pose_ratio_thr    = 0.15    # was 0.08 — edge noise flips ratio easily
+                _pose_centroid_thr = 40      # was 20 — YOLO centroid jitters +-10-15 px
+                _pose_angle_thr    = np.deg2rad(15)  # was 8 deg
+                _pose_area_thr     = 0.20    # was 0.10
+                _pose_ratio_thr    = 0.15    # was 0.08
 
                 if (_pose_centroid_drift > _pose_centroid_thr or
                         _pose_angle_diff   > _pose_angle_thr or
@@ -727,10 +805,8 @@ class RealtimeNailAnalyzer:
                     self.pose_locked = False
                     self.locked_pose = None
                     self.is_stable   = False
-                    # Clear just this slot's stability window, not a global one
                     if _cache_key in self._stability_windows:
                         self._stability_windows[_cache_key].clear()
-                    # Kill the ROI tracker so YOLO reacquires the nail
                     self.tracker_active = False
                     self.tracker = None
                     self.tracked_bbox = None
@@ -802,18 +878,21 @@ class RealtimeNailAnalyzer:
                     _use_cached_nb = True
 
             if not _use_cached_nb:
-                # Always run analysis — the print gate provides quality control.
-                # Skipping analysis here kept nail_bed_length_mm = None, which
-                # made _geom_valid = False, _conf_now = 0.0, so the print gate
-                # could never fire regardless of how steady the hand was.
-                lab_color, bgr_color, color_analysis, hex_color = extract_nail_color(
-                    _work_frame, _work_mask,
-                    nail_id=i + 1,
-                    nail_orientation=_nail_orientation,
-                    lab_frame=_work_lab,
-                )
+                # Only run expensive color analysis once the pose is locked;
+                # before stabilization the result would be discarded anyway.
+                if self.pose_locked:
+                    lab_color, bgr_color, color_analysis, hex_color = extract_nail_color(
+                        _work_frame, _work_mask,
+                        nail_id=i + 1,
+                        nail_orientation=_nail_orientation,
+                        lab_frame=_work_lab,
+                    )
+                else:
+                    lab_color = None
+                    bgr_color = None
+                    hex_color = None
+                    color_analysis = None
 
-                # Polish gate: skip nail-bed pipeline when polish detected.
                 _is_polished_rt = bool(
                     color_analysis and color_analysis.get("is_polished_detected", False)
                 )
@@ -826,7 +905,6 @@ class RealtimeNailAnalyzer:
                     _boundary_methods = 0
                     _boundary_conf    = 0.0
                 else:
-                    # Full pipeline: use diagnostics variant to get voting metadata
                     nail_bed_length_px, nail_bed_width_px, nail_bed_area_px, nb_diag = (
                         extract_geometry_nail_bed_with_diagnostics(
                             _work_frame, _work_mask,
@@ -835,13 +913,11 @@ class RealtimeNailAnalyzer:
                         )
                     )
 
-                    # Extract voting diagnostics from nb_diag
                     nail_bed_free_edge_present    = nb_diag.get("free_edge_present") if nb_diag else None
                     nail_bed_free_edge_confidence = nb_diag.get("free_edge_confidence", 0.0) if nb_diag else 0.0
                     _boundary_methods = nb_diag.get("boundary_methods_agreed", 0) if nb_diag else 0
                     _boundary_conf    = nb_diag.get("boundary_confidence", 0.0) if nb_diag else 0.0
 
-                    # Store result if high-quality (Goals 4 & 5: freeze boundary)
                     if (
                         _cache_key is not None
                         and nail_bed_length_px is not None
@@ -860,14 +936,20 @@ class RealtimeNailAnalyzer:
                             'boundary_confidence': _boundary_conf,
                         }
 
-            # Extract color only if not already done above (cached path)
+            # Extract color on cached path — only when pose is locked.
             if _use_cached_nb:
-                lab_color, bgr_color, color_analysis, hex_color = extract_nail_color(
-                    _work_frame, _work_mask,
-                    nail_id=i + 1,
-                    nail_orientation=_nail_orientation,
-                    lab_frame=_work_lab,
-                )
+                if self.pose_locked:
+                    lab_color, bgr_color, color_analysis, hex_color = extract_nail_color(
+                        _work_frame, _work_mask,
+                        nail_id=i + 1,
+                        nail_orientation=_nail_orientation,
+                        lab_frame=_work_lab,
+                    )
+                else:
+                    lab_color = None
+                    bgr_color = None
+                    hex_color = None
+                    color_analysis = None
 
             # ── Temporal smoothing of boundary_proj ───────────────────────────────────
             # Prevents frame-to-frame jitter in boundary detection.
@@ -907,16 +989,61 @@ class RealtimeNailAnalyzer:
                 else:
                     _smoothed_boundary_proj = None
             
+            # ── Nail-bed geometry fallback & safety clamp ─────────────────────
+            # When boundary detection fails (no methods agreed) or returned no
+            # measurement, copy full-nail geometry so downstream code always has
+            # a finite, self-consistent nail-bed value and no anatomically
+            # impossible ratio can be produced.
+            if _boundary_methods == 0 or nail_bed_length_px is None:
+                nail_bed_length_px         = length_px
+                nail_bed_width_px          = width_px
+                nail_bed_area_px           = area_px
+                nail_bed_free_edge_present = False
+
+            # Safety clamp: nail-bed length can never physically exceed the
+            # full nail length (e.g. projection rounding or anatomical prior
+            # overshoot).  Width and area are similarly bounded.
+            if nail_bed_length_px is not None and length_px and length_px > 0:
+                nail_bed_length_px = min(nail_bed_length_px, length_px)
+            if nail_bed_width_px is not None and width_px and width_px > 0:
+                nail_bed_width_px = min(nail_bed_width_px, width_px)
+            if nail_bed_area_px is not None and area_px and area_px > 0:
+                nail_bed_area_px = min(nail_bed_area_px, area_px)
+
             # Convert to mm — use temporally stabilized pixel measurements
             length_mm = self.calibrator.pixel_to_mm(length_stable)
             width_mm = self.calibrator.pixel_to_mm(width_stable)
-            area_mm2 = self.calibrator.pixel_area_to_mm2(area_px)
+            area_mm2 = self.calibrator.pixel_area_to_mm2(area_stable)
             
             # Convert nail bed to mm
             nail_bed_length_mm = self.calibrator.pixel_to_mm(nail_bed_length_px) if nail_bed_length_px else None
             nail_bed_width_mm = self.calibrator.pixel_to_mm(nail_bed_width_px) if nail_bed_width_px else None
             nail_bed_area_mm2 = self.calibrator.pixel_area_to_mm2(nail_bed_area_px) if nail_bed_area_px else None
             
+            # ── Free-edge detection temporal stabilization ─────────────────────
+            # Append detection results to per-slot history and require a
+            # majority vote (3/5 frames) before treating the boundary as
+            # present.  This prevents a single noisy frame from switching the
+            # measurement source between nail-bed and full-nail geometry.
+            # Only boolean results (True/False) are appended; None (cache hit
+            # or polished nail) is intentionally excluded to avoid diluting the
+            # vote on frames where detection was not actually run.
+            if _cache_key is not None and nail_bed_free_edge_present is not None:
+                _bp_hist = self._boundary_presence_history.setdefault(
+                    _cache_key, deque(maxlen=5)
+                )
+                _bp_hist.append(bool(nail_bed_free_edge_present))
+                stable_boundary = sum(_bp_hist) >= 3
+            elif _cache_key is not None and _cache_key in self._boundary_presence_history:
+                # Cache hit: reuse the last majority vote without adding a new sample.
+                _bp_hist = self._boundary_presence_history[_cache_key]
+                stable_boundary = sum(_bp_hist) >= 3
+            else:
+                # No history yet — treat as unstable.
+                stable_boundary = False
+            # Replace the raw per-frame flag with the temporally stable value.
+            nail_bed_free_edge_present = stable_boundary
+
             # Calculate full-nail aspect ratio from stabilized geometry (directional:
             # length/width, can be < 1).  Using stabilized values reduces ratio jitter
             # caused by per-frame segmentation noise.
@@ -927,6 +1054,13 @@ class RealtimeNailAnalyzer:
                 if (nail_bed_length_px and nail_bed_width_px and nail_bed_width_px > 1e-6)
                 else 0
             )
+            # Stable ratio policy: always prefer nail-bed ratio for medical measurements
+            # so that a temporary free-edge detection failure never causes a measurement
+            # jump by silently switching to full-nail geometry.
+            if nail_bed_length_px and nail_bed_width_px and nail_bed_width_px > 1e-6:
+                shape_ratio = nail_bed_length_px / nail_bed_width_px
+            else:
+                shape_ratio = length_stable / (width_stable + 1e-6)
             
             nail_data = {
                 'nail_id': i + 1,
@@ -936,7 +1070,8 @@ class RealtimeNailAnalyzer:
                 'length_mm': length_mm,
                 'width_mm': width_mm,
                 'area_mm2': area_mm2,
-                'aspect_ratio': aspect_ratio,
+                'aspect_ratio': aspect_ratio,   # kept for debug / tracking only
+                'shape_ratio': shape_ratio,        # primary: nail-bed when available
                 'nail_bed_length_px': nail_bed_length_px,
                 'nail_bed_width_px': nail_bed_width_px,
                 'nail_bed_area_px': nail_bed_area_px,
@@ -1010,7 +1145,25 @@ class RealtimeNailAnalyzer:
         self.current_nails = nails
         if len(self.nail_history) > 1:
            nails = self._smooth_nails(self.nail_history)
-        
+
+        # ── Per-frame cleanup of stabilization dictionaries ────────────────
+        # Evict the oldest slot once any dict exceeds MAX_TRACKED_SLOTS to
+        # prevent unbounded growth during long sessions.  Insertion order is
+        # preserved by dict, so next(iter(d)) always yields the oldest key.
+        _MAX_TRACKED_SLOTS = 30
+        for _cache_dict in [
+            self._stability_windows,
+            self._boundary_proj_history,
+            self._orientation_history,
+            self._length_history,
+            self._width_history,
+            self._area_history,
+            self._boundary_presence_history,
+        ]:
+            if len(_cache_dict) > _MAX_TRACKED_SLOTS:
+                _oldest_key = next(iter(_cache_dict))
+                del _cache_dict[_oldest_key]
+
         return frame, nails
     
     def _smooth_nails(self, history):
@@ -1170,7 +1323,23 @@ class RealtimeNailAnalyzer:
                 nail_smoothed['nail_bed_aspect_ratio'] = (
                     nail_smoothed['nail_bed_length_mm'] / nb_w if nb_w > 0 else 0
                 )
-            
+
+            # Recompute shape_ratio from smoothed values (stable ratio policy):
+            # keep nail-bed as primary source; fall back to full-nail geometry only
+            # when nail-bed measurements are genuinely absent this frame.
+            if nail_smoothed.get('nail_bed_length_mm') and nail_smoothed.get('nail_bed_width_mm'):
+                _nb_w_sm = nail_smoothed['nail_bed_width_mm']
+                nail_smoothed['shape_ratio'] = (
+                    nail_smoothed['nail_bed_length_mm'] / _nb_w_sm
+                    if _nb_w_sm > 1e-6 else nail_smoothed.get('shape_ratio', 0)
+                )
+            else:
+                _w_sm = nail_smoothed.get('width_mm') or 0
+                nail_smoothed['shape_ratio'] = (
+                    nail_smoothed['length_mm'] / (_w_sm + 1e-6)
+                    if nail_smoothed.get('length_mm') else nail_smoothed.get('shape_ratio', 0)
+                )
+
             smoothed_nails.append(nail_smoothed)
         
         return smoothed_nails
@@ -1250,7 +1419,7 @@ class RealtimeNailAnalyzer:
                 cv2.putText(output, f"Bed Shape:  {_bed_ratio:.2f}x",
                            (20, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 1)
                 text_y += line_height
-            cv2.putText(output, f"Nail Shape: {nail['aspect_ratio']:.2f}x",
+            cv2.putText(output, f"Nail Shape: {nail.get('shape_ratio', nail['aspect_ratio']):.2f}x",
                        (20, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 255), 1)
             text_y += line_height
 
@@ -1524,10 +1693,10 @@ class RealtimeNailAnalyzer:
                         # Print ONLY nail bed details
                         if nail.get('nail_bed_length_mm') is not None:
                             print(f"\nNail Bed Geometry:")
-                            print(f"  Shape Ratio: {nail['nail_bed_aspect_ratio']:.2f}x "
+                            print(f"  Shape Ratio: {nail.get('shape_ratio', nail['nail_bed_aspect_ratio']):.2f}x "
                                   "(length/breadth)")
                             print(f"  Full Nail Ratio: {nail['aspect_ratio']:.2f}x "
-                                  "(length/breadth)")
+                                  "(length/breadth) [debug]")
                             print(f"  Area:        {nail['nail_bed_area_mm2']:.1f} mm²")
 
                             # Boundary detection diagnostics

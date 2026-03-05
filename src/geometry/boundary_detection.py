@@ -235,6 +235,18 @@ def detect_free_edge_boundary(
     _grad_max = float(np.max(grad_profile))
     grad_norm = grad_profile / (_grad_max + _eps) if _grad_max > _eps else grad_profile
 
+    # Mean gradient energy near each end (used as tie-breaker when BWC is ambiguous).
+    # Slices cover the outer 15 % of the nail at each end so the regions are
+    # safely clear of the central nail body.
+    _grad_has_signal = _grad_max > _eps
+    if _grad_has_signal and N > 0:
+        _distal_start = int(0.85 * N)
+        _prox_end     = int(0.15 * N)
+        grad_distal = float(np.nanmean(grad_norm[_distal_start:])) if _distal_start < N else 0.0
+        grad_prox   = float(np.nanmean(grad_norm[:_prox_end]))     if _prox_end > 0   else 0.0
+    else:
+        grad_distal = grad_prox = 0.0
+
     # ── Combined-score end selection ──────────────────────────────────────────
     # score = BWC × mean_L per end.  Free edge = high BWC AND high L.
     # Lunula = similar BWC but meaningfully lower L.  Score separates them.
@@ -264,7 +276,18 @@ def detect_free_edge_boundary(
                   f"bc_min={bc_min:.2f}(mL={mL_min:.0f})  "
                   f"scores: {score_max:.0f} vs {score_min:.0f}")
     else:
-        end_is_distal = taper_distal
+        # BWC is ambiguous (<0.12 gap): use gradient energy near the nail ends
+        # as a supporting signal before falling back to taper orientation.
+        # The free edge typically shows a stronger intensity transition than the
+        # lunula / proximal fold, so higher end-gradient implies the distal end.
+        if _grad_has_signal and abs(grad_distal - grad_prox) > 0.08:
+            end_is_distal = grad_distal > grad_prox
+            if debug:
+                print(f"[BoundaryDetect] Gradient tie-breaker: "
+                      f"grad_distal={grad_distal:.3f}  grad_prox={grad_prox:.3f}  "
+                      f"→ end_is_distal={end_is_distal}")
+        else:
+            end_is_distal = taper_distal
 
     # ── Region classification ─────────────────────────────────────────────────
     if end_is_distal:
