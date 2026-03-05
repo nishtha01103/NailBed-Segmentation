@@ -23,6 +23,12 @@ LAB_B_OUTLIER_PERCENTILE = 15
 NORMALIZE_WHITE_BALANCE = False  # Disable white balance - can overcorrect and desaturate nail colors
 WHITE_BALANCE_METHOD = "gray_world"  # Method: 'gray_world' or 'none'
 
+# Single-Scale Retinex illumination normalization (L channel only)
+# Retinex improves illumination invariance for nail color diagnostics.
+# Must process 720p frame in <10ms — uses GaussianBlur on L channel only.
+ENABLE_RETINEX = True          # Enable SSR illumination normalization
+RETINEX_SIGMA = 30              # Gaussian blur radius for SSR surround function
+
 # Geometry measurement (rotation-invariant)
 MIN_CONTOUR_AREA = 800  # Pixels² (stricter to filter noise)
 MIN_NAIL_ASPECT_RATIO = 0.40  # Minimum length/width ratio (allows very wide thumbs)

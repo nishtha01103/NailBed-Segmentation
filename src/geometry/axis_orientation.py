@@ -1,10 +1,19 @@
-"""Anatomical axis orientation using scoring-based selection.
+"""
+Geometry-only anatomical axis orientation.
 
-Fully rotation-invariant — does not assume PCA eigenvalue ordering
-corresponds to anatomical length vs width.
+Stable, rotation-invariant, lighting-independent.
+
+STABILITY IMPROVEMENTS v2:
+  - Taper uses ALL mask pixels (not just contour boundary points).
+    Pixel-based statistics are ~5x less noisy than contour-only.
+  - Canonical axis direction: force +x hemisphere before taper to
+    prevent ±180 flip when minAreaRect w_rect ≈ h_rect.
+  - Curvature fallback threshold raised 0.01→0.02 (require clearer signal).
+  - Image-top heuristic fallback: when taper AND curvature are ambiguous,
+    the proximal end is closer to image TOP (standard palm-down camera).
 """
 
-from typing import Tuple, Optional
+from typing import Tuple
 import cv2
 import numpy as np
 
@@ -13,108 +22,129 @@ def _orient_anatomical_axis(
     image: np.ndarray,
     mask: np.ndarray,
     centroid: np.ndarray,
-    major_axis: np.ndarray,  # Unused, kept for API compatibility
-    minor_axis: np.ndarray,  # Unused, kept for API compatibility
-    lab_frame: Optional[np.ndarray] = None,
+    major_axis_unused: np.ndarray,
+    minor_axis_unused: np.ndarray,
+    lab_frame=None,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Orient anatomical axes using minAreaRect, not PCA.
+    """Determine the proximal→distal anatomical axis from mask geometry.
 
-    Steps:
-    - Extract largest contour from mask.
-    - Use cv2.minAreaRect to get rectangle.
-    - The longer side is the anatomical axis (proximal→distal).
-    - The shorter side is the width axis.
-    - Determine distal direction by width at ends (narrower = distal),
-      or fallback to brightness if taper is weak.
     Returns:
-        anatomical_axis_vector, width_axis_vector, distal_sign (+1 or -1)
+        anatomical_axis : unit vector pointing proximal → distal  (x, y)
+        width_axis      : unit vector perpendicular to anatomical  (x, y)
+        distal_sign     : +1 (distal = MAX projection) or -1 (distal = MIN)
     """
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE
+    )
+
     if not contours:
-        # Fallback: return x and y axes
         return np.array([1.0, 0.0]), np.array([0.0, 1.0]), 1
+
     contour = max(contours, key=cv2.contourArea)
+
+    # ── 1. Long axis from minAreaRect ────────────────────────────────────
     rect = cv2.minAreaRect(contour)
-    (center_x, center_y), (width, height), angle = rect
-    # Determine which is longer
-    if width >= height:
-        long_len, short_len = width, height
+    (cx, cy), (w_rect, h_rect), angle = rect
+
+    if w_rect >= h_rect:
         angle_rad = np.deg2rad(angle)
     else:
-        long_len, short_len = height, width
         angle_rad = np.deg2rad(angle + 90)
-    # Anatomical axis (proximal→distal) from minAreaRect
-    axis_rect = np.array([np.cos(angle_rad), np.sin(angle_rad)])
-    # PCA axis
+
+    anatomical_axis = np.array(
+        [np.cos(angle_rad), np.sin(angle_rad)],
+        dtype=np.float64
+    )
+    anatomical_axis /= np.linalg.norm(anatomical_axis)
+
+    # Force canonical direction (+x hemisphere) to prevent ±180 flip
+    if anatomical_axis[0] < 0:
+        anatomical_axis = -anatomical_axis
+
+    width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]], dtype=np.float64)
+
+    # ── 2. Project ALL mask pixels (not contour) ─────────────────────────
     nail_yx = np.argwhere(mask == 255)
-    nail_xy = nail_yx[:, ::-1].astype(np.float64)
-    centered = nail_xy - np.array([center_x, center_y])
-    cov = np.cov(centered, rowvar=False)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    axis_pca = eigvecs[:, np.argmax(eigvals)]
-    axis_pca = axis_pca / np.linalg.norm(axis_pca)
-    # Compare axes
-    dot = np.clip(np.dot(axis_rect, axis_pca), -1, 1)
-    angle_diff = np.degrees(np.arccos(abs(dot)))
-    if angle_diff > 40:
-        anatomical_axis = axis_pca
-        width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]])
+    if len(nail_yx) < 20:
+        nail_xy = contour.reshape(-1, 2).astype(np.float64)
     else:
-        anatomical_axis = axis_rect
-        width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]])
-    # Project all mask points onto anatomical axis
-    nail_yx = np.argwhere(mask == 255)
-    nail_xy = nail_yx[:, ::-1].astype(np.float64)
-    proj = (nail_xy - np.array([center_x, center_y])) @ anatomical_axis
-    # Split into two ends
-    q = max(10, len(proj) // 5)
-    sort_idx = np.argsort(proj)
-    end1_idx = sort_idx[:q]
-    end2_idx = sort_idx[-q:]
-    # Width at each end
-    perp = width_axis
-    p_perp = (nail_xy - np.array([center_x, center_y])) @ perp
-    # Robust distal determination
-    if lab_frame is not None:
-        lab_img = lab_frame
-    else:
-        lab_img = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-    L_all = lab_img[:, :, 0][nail_yx[:, 0], nail_yx[:, 1]]
-    a_all = lab_img[:, :, 1][nail_yx[:, 0], nail_yx[:, 1]]
-    perp = width_axis
-    p_perp = (nail_xy - np.array([center_x, center_y])) @ perp
-    w1 = float(np.mean(np.abs(p_perp[end1_idx])))
-    w2 = float(np.mean(np.abs(p_perp[end2_idx])))
-    norm_L1 = (np.mean(L_all[end1_idx]) - np.mean(L_all)) / (np.std(L_all) + 1e-6)
-    norm_L2 = (np.mean(L_all[end2_idx]) - np.mean(L_all)) / (np.std(L_all) + 1e-6)
-    norm_a1 = (np.mean(a_all[end1_idx]) - np.mean(a_all)) / (np.std(a_all) + 1e-6)
-    norm_a2 = (np.mean(a_all[end2_idx]) - np.mean(a_all)) / (np.std(a_all) + 1e-6)
-    norm_w1 = (w1 - np.mean([w1, w2])) / (np.std([w1, w2]) + 1e-6)
-    norm_w2 = (w2 - np.mean([w1, w2])) / (np.std([w1, w2]) + 1e-6)
-    score1 = +norm_L1 - norm_a1 - norm_w1
-    score2 = +norm_L2 - norm_a2 - norm_w2
-    distal_sign = 1 if score2 > score1 else -1
-    anatomical_axis = anatomical_axis * distal_sign
-    width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]])
-    return anatomical_axis, width_axis, distal_sign
-    w1 = float(np.percentile(p_perp[end1_idx], 95) - np.percentile(p_perp[end1_idx], 5))
-    w2 = float(np.percentile(p_perp[end2_idx], 95) - np.percentile(p_perp[end2_idx], 5))
-    avg_w = 0.5 * (w1 + w2)
-    taper = abs(w1 - w2) / max(avg_w, 1.0)
-    # Decide distal direction
-    if taper > 0.10:
-        distal_sign = 1 if w2 < w1 else -1  # distal = narrower end
-    else:
-        # Use brightness (L channel) if taper is weak
-        if lab_frame is not None:
-            lab_img = lab_frame
+        nail_xy = nail_yx[:, ::-1].astype(np.float64)
+
+    centered   = nail_xy - np.array([cx, cy])
+    proj_major = centered @ anatomical_axis
+    proj_minor = centered @ width_axis
+
+    span      = proj_major.max() - proj_major.min()
+    edge_span = 0.20 * span
+
+    first_mask = proj_major < (proj_major.min() + edge_span)
+    last_mask  = proj_major > (proj_major.max() - edge_span)
+
+    if first_mask.sum() < 4 or last_mask.sum() < 4:
+        return anatomical_axis, width_axis, 1
+
+    # ── 3. Width taper (pixel-based, robust) ─────────────────────────────
+    def robust_width(vals):
+        if len(vals) < 4:
+            return 0.0
+        return float(np.percentile(vals, 92) - np.percentile(vals, 8))
+
+    w1 = robust_width(proj_minor[first_mask])
+    w2 = robust_width(proj_minor[last_mask])
+
+    avg_w       = 0.5 * (w1 + w2)
+    taper_ratio = abs(w1 - w2) / max(avg_w, 1.0)
+
+    # ── 4. Curvature fallback ─────────────────────────────────────────────
+    contour_xy = contour.reshape(-1, 2).astype(np.float64)
+    cont_cent  = contour_xy - np.array([cx, cy])
+    cont_proj  = cont_cent @ anatomical_axis
+    c_min, c_max = cont_proj.min(), cont_proj.max()
+    c_span = c_max - c_min
+
+    def edge_curvature(side_last: bool):
+        if c_span < 1:
+            return 0.0
+        if side_last:
+            in_r = cont_proj > (c_min + 0.80 * c_span)
         else:
-            lab_img = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
-        L_all = lab_img[:, :, 0][nail_yx[:, 0], nail_yx[:, 1]]
-        L1 = float(np.mean(L_all[end1_idx]))
-        L2 = float(np.mean(L_all[end2_idx]))
-        distal_sign = 1 if L2 > L1 else -1  # distal = brighter end
-    # Orient anatomical_axis so positive direction is proximal→distal
+            in_r = cont_proj < (c_min + 0.20 * c_span)
+        pts = contour_xy[in_r]
+        if len(pts) < 10:
+            return 0.0
+        diffs  = np.diff(pts, axis=0)
+        angles = np.arctan2(diffs[:, 1], diffs[:, 0])
+        return float(np.mean(np.abs(np.diff(angles))))
+
+    curv1 = edge_curvature(side_last=False)
+    curv2 = edge_curvature(side_last=True)
+
+    # ── 5. Decision: taper → curvature → image-top heuristic ─────────────
+    if taper_ratio > 0.07:
+        # Wider end = proximal; nail tapers toward free edge
+        distal_is_last = w2 < w1
+
+    elif abs(curv2 - curv1) > 0.02:
+        # More curved end = distal (rounded free edge)
+        distal_is_last = curv2 > curv1
+
+    else:
+        # Image-top heuristic: proximal (cuticle) is HIGHER in the image
+        # (smaller row index = smaller y-coordinate = top of image).
+        # For standard palm-down, camera-above setup, proximal end is
+        # closer to the top of the frame.
+        # first_mask = MIN-proj end; last_mask = MAX-proj end.
+        # We use nail_yx (row = y in image) to measure which end is higher.
+        mean_y_first = float(np.mean(nail_yx[first_mask, 0]))
+        mean_y_last  = float(np.mean(nail_yx[last_mask,  0]))
+        # Proximal = smaller y (higher in image). If MAX-proj end is lower
+        # in image (larger y) then MAX-proj = distal.
+        distal_is_last = mean_y_last > mean_y_first
+
+    distal_sign    = 1 if distal_is_last else -1
     anatomical_axis = anatomical_axis * distal_sign
-    width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]])
+    width_axis = np.array([-anatomical_axis[1], anatomical_axis[0]], dtype=np.float64)
+
     return anatomical_axis, width_axis, distal_sign

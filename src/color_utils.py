@@ -14,6 +14,8 @@ from config import (
     ENABLE_TEXTURE_ANALYSIS,
     TEXTURE_ANALYSIS_DETAIL_LEVEL,
     TEXTURE_MIN_IMAGE_QUALITY,
+    ENABLE_RETINEX,
+    RETINEX_SIGMA,
 )
 
 # Import texture analysis (optional, graceful degradation)
@@ -71,6 +73,63 @@ def normalize_white_balance(image: np.ndarray) -> np.ndarray:
     return result
 
 
+def apply_retinex_L_channel(image_bgr: np.ndarray) -> np.ndarray:
+    """Apply Single-Scale Retinex (SSR) to the L channel for illumination normalization.
+
+    Retinex improves illumination invariance for nail color diagnostics.
+
+    Converts the image to LAB, applies SSR to the L channel only, then
+    reconstructs the BGR image.  Operating on L only avoids hue distortion
+    while correcting spatially uneven lighting — the dominant error source for
+    nail color analysis.
+
+    SSR formula (per pixel):
+        L_ssr = log(L + eps) - log(GaussianBlur(L + eps, sigma=RETINEX_SIGMA))
+
+    The result is linearly rescaled from its observed [min, max] to [0, 255].
+
+    Performance: a single-channel GaussianBlur at sigma=30 on a 720p frame
+    completes in well under 10 ms on modern hardware.
+
+    This function is a no-op (returns the original image) when ENABLE_RETINEX
+    is False, keeping it safe to call unconditionally in the pipeline.
+
+    Args:
+        image_bgr: BGR image (uint8).
+
+    Returns:
+        BGR image (uint8) with SSR applied to L channel, or the original
+        image unchanged when ENABLE_RETINEX is False.
+    """
+    if not ENABLE_RETINEX:
+        return image_bgr
+
+    # Convert to LAB (float32); L is in [0, 255] in OpenCV's 8-bit convention
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    L = lab[:, :, 0]  # extract L channel
+
+    eps = 1.0
+    # Compute SSR: log(L+eps) - log(blur(L+eps))
+    log_L    = np.log(L + eps)
+    blur_L   = cv2.GaussianBlur(L + eps, (0, 0), sigmaX=RETINEX_SIGMA)
+    log_blur = np.log(np.maximum(blur_L, eps))
+    ssr      = log_L - log_blur  # (H, W) float32
+
+    # Normalize SSR to [0, 255] without slow pixel loops
+    ssr_min = float(ssr.min())
+    ssr_max = float(ssr.max())
+    ssr_range = ssr_max - ssr_min
+    if ssr_range > 0:
+        L_norm = (ssr - ssr_min) / ssr_range * 255.0
+    else:
+        L_norm = np.zeros_like(ssr)
+
+    # Replace L channel and reconstruct BGR
+    lab[:, :, 0] = np.clip(L_norm, 0.0, 255.0)
+    result = cv2.cvtColor(lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return result
+
+
 def _remove_color_outliers(pixels: np.ndarray) -> np.ndarray:
     """Remove chromaticity outliers from LAB pixels using percentile clipping.
     
@@ -106,12 +165,19 @@ def _remove_color_outliers(pixels: np.ndarray) -> np.ndarray:
     return pixels[mask]
 
 
-def _extract_skin_reference(image: np.ndarray, mask: np.ndarray, dilation_pixels: int = 12) -> Optional[List[float]]:
+def _extract_skin_reference(image: np.ndarray, mask: np.ndarray, dilation_pixels: int = 12) -> Tuple[Optional[List[float]], str]:
     """Extract reference skin color from area surrounding nail.
     
     Creates a ring around the nail mask and samples the median LAB color
     from that region. This provides a per-person skin tone reference for
     relative color analysis, making the system adaptive across ethnicities.
+
+    Ensures reliable skin-referenced color analysis by validating pixel count
+    and lighting stability before committing to a confidence level:
+      - "ok"         → ≥500 pixels and L variance ≤ 50
+      - "low"        → fewer than 500 skin pixels (sparse ring, small nail)
+      - "unstable"   → ≥500 pixels but L variance > 50 (uneven lighting)
+      - "unavailable"→ fewer than 50 pixels (cannot compute reference at all)
     
     Args:
         image: BGR image
@@ -119,7 +185,7 @@ def _extract_skin_reference(image: np.ndarray, mask: np.ndarray, dilation_pixels
         dilation_pixels: How many pixels to dilate for skin ring (default: 12)
     
     Returns:
-        Median LAB values of surrounding skin, or None if insufficient pixels
+        Tuple of (median LAB list or None, confidence string)
     """
     # Create skin ring mask by dilating and subtracting original
     kernel = np.ones((dilation_pixels, dilation_pixels), np.uint8)
@@ -138,12 +204,25 @@ def _extract_skin_reference(image: np.ndarray, mask: np.ndarray, dilation_pixels
     
     # Need sufficient pixels for reliable skin reference (minimum 50)
     if len(skin_pixels) < 50:
-        return None
+        return None, "unavailable"
     
     # Use median for robustness against outliers
     skin_median_lab = np.median(skin_pixels, axis=0)
+
+    # ── Skin reference validation ─────────────────────────────────────────
+    # Ensures reliable skin-referenced color analysis.
+    skin_pixel_count = len(skin_pixels)
+    L_variance = float(np.var(skin_pixels[:, 0].astype(np.float32)))
+
+    if skin_pixel_count < 500:
+        skin_confidence = "low"        # sparse ring — less reliable median
+    elif L_variance > 50.0:
+        skin_confidence = "unstable"   # uneven lighting across skin ring
+    else:
+        skin_confidence = "ok"
+    # ──────────────────────────────────────────────────────────────────────
     
-    return skin_median_lab.tolist()
+    return skin_median_lab.tolist(), skin_confidence
 
 
 def _detect_polished_nail(pixels_lab: np.ndarray) -> Tuple[bool, float]:
@@ -195,6 +274,9 @@ def _check_lighting_quality(pixels_lab: np.ndarray) -> Tuple[bool, str]:
     std_L    = float(np.std(L))
     glare_fraction = float(np.mean(L > 230))
 
+    # Very low L variance → nail is featureless/uniform (per PDF: unreliable)
+    if std_L < 5.0:
+        return False, "uniform_nail"
     if median_L > 220:
         return False, "overexposed"
     if median_L < 60:
@@ -267,8 +349,62 @@ def _otsu_filter_nail_pixels(
     return pixels_lab[keep]
 
 
+def _apply_skin_reference_normalization(
+    pixels_lab: np.ndarray,
+    skin_reference_lab: Optional[List[float]],
+) -> np.ndarray:
+    """Apply skin-referenced L-channel normalization to nail LAB pixels.
+
+    Skin-referenced normalization improves cross-lighting robustness.
+
+    Computes a per-frame L adjustment derived from surrounding skin and
+    shifts all nail pixel L values so that the result is relative to a
+    neutral skin baseline (L=50).  This cancels systematic over/under-
+    exposure that affects nail and skin equally, reducing inter-frame
+    lighting bias without altering chromaticity (a*, b*).
+
+    Formula::
+
+        L_adjustment = clip(L_skin_median - 50, -10, +10)
+        L_corrected  = L_nail - L_adjustment
+
+    The ±10 cap prevents extreme skin tones or heavy shadow from
+    over-correcting and pushing nail L outside the valid LAB range.
+    Returns pixels unchanged when skin_reference_lab is None so all
+    existing call sites that omit a skin reference are unaffected.
+
+    Args:
+        pixels_lab       : (N, 3) float32/uint8 LAB array of nail pixels.
+        skin_reference_lab: Median LAB of surrounding skin ring, or None.
+
+    Returns:
+        (N, 3) array with corrected L channel (same dtype as input).
+    """
+    if skin_reference_lab is None or len(skin_reference_lab) < 1:
+        return pixels_lab
+
+    L_skin      = float(skin_reference_lab[0])
+    L_adjust    = float(np.clip(L_skin - 50.0, -10.0, 10.0))
+
+    if L_adjust == 0.0:
+        return pixels_lab
+
+    corrected          = pixels_lab.copy().astype(np.float32)
+    corrected[:, 0]   -= L_adjust
+    corrected[:, 0]    = np.clip(corrected[:, 0], 0.0, 255.0)
+    return corrected.astype(pixels_lab.dtype)
+
+
 def extract_nail_color(
-    image: np.ndarray, mask: np.ndarray, enable_texture: bool = None
+    image: np.ndarray,
+    mask: np.ndarray,
+    enable_texture: bool = None,
+    nail_bed_mask: Optional[np.ndarray] = None,
+    free_edge_present: Optional[bool] = None,
+    boundary_confidence: float = 0.0,
+    nail_id=None,
+    nail_orientation: Optional[float] = None,
+    lab_frame: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[List[float]], Optional[List[int]], Optional[dict], Optional[str]]:
     """Extract natural nail plate color with skin-adaptive medical screening.
     
@@ -295,16 +431,38 @@ def extract_nail_color(
 
     # Extract skin reference BEFORE erosion (need full mask for skin ring)
     # This provides per-person baseline for relative color analysis
-    skin_reference_lab = _extract_skin_reference(image, mask)
+    skin_reference_lab, skin_color_confidence = _extract_skin_reference(image, mask)
 
-    # Reduced erosion to prevent over-shrinking small nails
-    # Use only central region of nail mask to avoid skin contamination
-    kernel = np.ones((5, 5), np.uint8)
-    refined_mask = cv2.erode(mask, kernel, iterations=1)
+    # ── Mask selection (PDF: sample nail BED only, never free edge) ────────
+    # When a reliable nail-bed boundary has been detected (free_edge_present=True
+    # AND boundary_confidence >= 0.50), use the nail_bed_mask directly.
+    # Free-edge pixels are white/translucent (high L) and inflate median L,
+    # making a healthy nail look pale — a false anemia signal.
+    # Fallback: erode full mask to reduce skin contamination at edges.
+    _use_nail_bed_mask = (
+        nail_bed_mask is not None
+        and free_edge_present is True
+        and boundary_confidence >= 0.50
+        and int(nail_bed_mask.sum() // 255) >= MIN_PIXELS_FOR_COLOR
+    )
+    if _use_nail_bed_mask:
+        # Mild 3px erosion on nail bed mask to avoid boundary-edge pixels
+        refined_mask = cv2.erode(
+            nail_bed_mask, np.ones((3, 3), np.uint8), iterations=1
+        )
+    else:
+        # Reduced erosion to prevent over-shrinking small nails
+        # Use only central region of nail mask to avoid skin contamination
+        kernel = np.ones((5, 5), np.uint8)
+        refined_mask = cv2.erode(mask, kernel, iterations=1)
 
     # Apply CLAHE to full image FIRST (correct tile statistics),
     # then mask to nail region
-    lab_full = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lab_full = (
+        lab_frame.astype(np.uint8)
+        if lab_frame is not None
+        else cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    )
     L_full, A_full, B_full = cv2.split(lab_full)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     L_eq = clahe.apply(L_full)
@@ -320,6 +478,17 @@ def extract_nail_color(
     # This removes specular spots that would inflate L and whiten the color
     pixels = _otsu_filter_nail_pixels(pixels, _pixels_gray)
     # Note: after _otsu_filter_nail_pixels, pixels is already filtered
+
+    # ── P95 hard glare removal (PDF recommendation) ─────────────────────────
+    # Belt-and-suspenders: Otsu splits at a threshold optimised for bimodal
+    # distributions, but can miss glare when highlights are < 5% of pixels.
+    # A hard P95 cut always removes the brightest 5%, regardless of distribution.
+    # Only applied when it leaves enough pixels for a valid measurement.
+    if len(pixels) >= 40:
+        _L_p95 = float(np.percentile(pixels[:, 0], 95))
+        _no_glare = pixels[:, 0] < _L_p95
+        if int(_no_glare.sum()) >= MIN_PIXELS_AFTER_FILTERING:
+            pixels = pixels[_no_glare]
 
     if len(pixels) < MIN_PIXELS_FOR_COLOR:
         return None, None, None, None
@@ -340,6 +509,18 @@ def extract_nail_color(
     # Detect polish — affects downstream interpretation
     _is_polished, _polish_conf = _detect_polished_nail(pixels)
 
+    # Polish gate: skip all analysis for polished nails.
+    # Nail polish disrupts LAB gradients, boundary detection, and every
+    # downstream health-screening metric — returning early prevents the
+    # system from emitting misleading results for polished nails.
+    if _is_polished and _polish_conf >= 0.5:
+        return None, None, {
+            "skipped":             "polished",
+            "is_polished_detected": True,
+            "polish_confidence":   round(_polish_conf, 2),
+            "screening_summary":   "polished_nail",
+        }, None
+
     # Check lighting quality — flags low confidence if poor
     _lighting_ok, _lighting_reason = _check_lighting_quality(pixels)
     if not _lighting_ok:
@@ -348,10 +529,14 @@ def extract_nail_color(
         pass  # will be added to color_analysis dict below
 
     # Restrict color sampling to central 60% of nail (proximal 20% and distal 20% excluded)
-    # This avoids cuticle and free-edge contamination of the color reading
-    # We need the mask to compute the PCA major axis extent for this
-    nail_yx_color = np.argwhere(refined_mask == 255)
-    if len(nail_yx_color) > 20:
+    # This avoids cuticle and free-edge contamination of the color reading.
+    # SKIP this crop when nail_bed_mask was used: that mask already defines
+    # the correct anatomical region; further cropping over-restricts small beds.
+    if _use_nail_bed_mask:
+        nail_yx_color = None  # skip central crop
+    else:
+        nail_yx_color = np.argwhere(refined_mask == 255)
+    if nail_yx_color is not None and len(nail_yx_color) > 20:
         nail_xy_color = nail_yx_color[:, ::-1].astype(np.float64)
         centroid_color = nail_xy_color.mean(axis=0)
         cov_color = np.cov((nail_xy_color - centroid_color).T)
@@ -373,6 +558,11 @@ def extract_nail_color(
             if len(pixels) >= MIN_PIXELS_AFTER_FILTERING:
                 pixels = _remove_color_outliers(pixels)
 
+    # Skin-referenced normalization improves cross-lighting robustness.
+    # Applied last so every filtering stage above operates on raw LAB values;
+    # only the final measurement fed into the median is skin-corrected.
+    pixels = _apply_skin_reference_normalization(pixels, skin_reference_lab)
+
     # Use median for robustness against remaining outliers
     median_lab = np.median(pixels, axis=0)
 
@@ -385,14 +575,52 @@ def extract_nail_color(
 
     # Perform skin-adaptive medical color analysis
     color_analysis = analyze_lab_distribution(
-        pixels, 
+        pixels,
         skin_reference_lab=skin_reference_lab,
         image=image,
         mask=mask,
         enable_texture=enable_texture,
         is_polished_detected=_is_polished,
         lighting_quality=_lighting_reason if not _lighting_ok else "ok",
+        color_sampled_from_nail_bed=_use_nail_bed_mask,
+        nail_orientation=nail_orientation,
+        nail_id=nail_id,
     )
+
+    # ── Skin-Referenced Relative Color Index (SRCI) ──────────────────────────
+    # Skin-referenced color reduces lighting dependency.
+    # Expresses nail LAB values relative to the surrounding skin tone so that
+    # absolute illumination shifts cancel out.  delta_* values are therefore
+    # comparable across frames and lighting conditions.
+    #
+    #   delta_L < 0  → nail lighter than skin  (pallor / anemia indicator)
+    #   delta_a > 0  → nail redder than skin   (inflammation indicator)
+    #   delta_b < 0  → nail bluer than skin    (cyanosis indicator)
+    if skin_reference_lab is not None:
+        L_nail, a_nail, b_nail = float(median_lab[0]), float(median_lab[1]), float(median_lab[2])
+        L_skin, a_skin, b_skin = float(skin_reference_lab[0]), float(skin_reference_lab[1]), float(skin_reference_lab[2])
+
+        delta_L = L_nail - L_skin
+        delta_a = a_nail - a_skin
+        delta_b = b_nail - b_skin
+
+        relative_color = {
+            "delta_L":              round(delta_L, 3),
+            "delta_a":              round(delta_a, 3),
+            "delta_b":              round(delta_b, 3),
+            # Derived clinical indices
+            "redness_index":        round(delta_a, 3),   # inflammation: delta_a increases
+            "pallor_index":         round(-delta_L, 3),  # anemia:       delta_L decreases (nail lighter)
+            "cyanosis_index":       round(-delta_b, 3),  # hypoxia:      delta_b decreases (nail bluer)
+            "skin_lab":             [round(L_skin, 3), round(a_skin, 3), round(b_skin, 3)],
+            "color_confidence":     skin_color_confidence,  # "ok" | "low" | "unstable"
+        }
+    else:
+        relative_color = {"color_confidence": skin_color_confidence}
+
+    if color_analysis is not None:
+        color_analysis["relative_color"] = relative_color
+    # ─────────────────────────────────────────────────────────────────────────
 
     return median_lab.tolist(), bgr_color.tolist(), color_analysis, hex_color
 
@@ -408,6 +636,9 @@ def analyze_lab_distribution(
     enable_texture: bool = None,
     is_polished_detected: bool = False,
     lighting_quality: str = "ok",
+    color_sampled_from_nail_bed: bool = False,
+    nail_orientation: Optional[float] = None,
+    nail_id=None,
 ) -> dict:
     """Analyze LAB color distribution with skin-adaptive medical screening.
     
@@ -666,6 +897,9 @@ def analyze_lab_distribution(
         
         # Lighting quality
         "lighting_quality": lighting_quality,
+        # Whether color was sampled from confirmed nail bed only (not free edge)
+        # True = higher color accuracy; False = full nail mask used as fallback
+        "color_from_nail_bed": color_sampled_from_nail_bed,
     }
     
     # Polish override: if polish detected, color screening is unreliable
@@ -712,7 +946,11 @@ def analyze_lab_distribution(
     
     if enable_texture and TEXTURE_AVAILABLE and image is not None and mask is not None:
         try:
-            texture_results = analyze_nail_texture(image, mask)
+            texture_results = analyze_nail_texture(
+                image, mask,
+                nail_orientation=nail_orientation,
+                nail_id=nail_id,
+            )
             
             if texture_results:
                 screening_result = texture_results.get('screening_result', 'unknown')

@@ -18,16 +18,22 @@ import numpy as np
 
 
 # Global temporal smoothing buffers (for video processing)
-_ridge_history = deque(maxlen=5)
+_ridge_history    = deque(maxlen=5)
 _roughness_history = deque(maxlen=5)
-_baseline_ridge_values = []
-_baseline_roughness_values = []
+
+# Per-nail baseline tracking — prevents statistical contamination.
+# Per-nail baseline prevents statistical contamination.
+# Key: nail_id (any hashable) or '_default' for backward-compatible calls.
+# Value: {'ridge': List[float], 'roughness': List[float]}
+_baselines: dict = {}
 
 
 def analyze_nail_texture(
     image: np.ndarray,
     mask: np.ndarray,
-    nail_orientation: Optional[float] = None
+    nail_orientation: Optional[float] = None,
+    nail_id=None,
+    use_structure_tensor: bool = False,
 ) -> Dict:
     """Simplified texture screening for nail surface analysis.
     
@@ -44,7 +50,18 @@ def analyze_nail_texture(
     Args:
         image: BGR image
         mask: Binary nail mask (255 = nail, 0 = background)
-        nail_orientation: Not used (reserved for future orientation correction)
+        nail_orientation: Nail major-axis angle in radians.  When provided,
+            ridge detection projects Sobel gradients onto the minor axis for
+            orientation-aware measurement.  Pass None to use the legacy
+            vertical-Sobel fallback.
+        nail_id: Optional hashable identifier for the nail being analysed.
+            When provided, baseline statistics are tracked per nail to prevent
+            cross-subject contamination.  Defaults to a shared ``'_default'``
+            bucket for backward-compatible callers that don't pass an ID.
+        use_structure_tensor: When True, uses the structure tensor coherence
+            metric instead of the gradient projection metric for ridge
+            strength.  Requires more computation but measures directional
+            texture consistency more robustly.  Default False.
     
     Returns:
         Dictionary with quality score, metrics, and screening result
@@ -91,23 +108,51 @@ def analyze_nail_texture(
             'disclaimer': 'This is a screening tool only, not a medical diagnosis. Consult a healthcare professional for evaluation.'
         }
     
-    # 2. RIDGE STRENGTH MEASUREMENT (Sobel vertical gradient)
-    ridge_strength = _measure_ridge_strength(nail_crop_normalized, mask_crop)
-    
+    # ── Specular glare suppression ────────────────────────────────────────────
+    # Suppressing specular highlights improves texture reliability.
+    # Extreme specular pixels (near-white, achromatic) falsely inflate both
+    # gradient and variance metrics.  We identify them in LAB space and zero
+    # them out in a local copy of the mask so the original is never mutated.
+    lab_crop = cv2.cvtColor(image[y:y+h, x:x+w], cv2.COLOR_BGR2LAB)
+    L_ch  = lab_crop[:, :, 0].astype(np.int16)   # 0..255 in OpenCV uint8 LAB
+    a_ch  = lab_crop[:, :, 1].astype(np.int16)
+    b_ch  = lab_crop[:, :, 2].astype(np.int16)
+    glare_mask = (
+        (L_ch > 240) &
+        (np.abs(a_ch - 128) < 10) &
+        (np.abs(b_ch - 128) < 10)
+    )
+    # Local copy — never modifies the caller's mask array
+    mask_texture = mask_crop.copy()
+    mask_texture[glare_mask] = 0
+
+    # 2. RIDGE STRENGTH MEASUREMENT (orientation-aware Sobel gradient)
+    ridge_strength = _measure_ridge_strength(
+        nail_crop_normalized, mask_texture, nail_orientation,
+        use_structure_tensor=use_structure_tensor,
+    )
+
     # 3. SURFACE ROUGHNESS MEASUREMENT (local variance)
-    surface_roughness = _measure_surface_roughness(nail_crop_normalized, mask_crop)
+    surface_roughness = _measure_surface_roughness(nail_crop_normalized, mask_texture)
     
     # 4. TEMPORAL SMOOTHING (average over recent frames)
     ridge_strength_smoothed = _apply_temporal_smoothing(ridge_strength, _ridge_history)
     roughness_smoothed = _apply_temporal_smoothing(surface_roughness, _roughness_history)
     
+    # ── Per-nail baseline lookup (create slot on first visit) ────────────────
+    # Per-nail baseline prevents statistical contamination.
+    _nail_key = nail_id if nail_id is not None else '_default'
+    if _nail_key not in _baselines:
+        _baselines[_nail_key] = {'ridge': [], 'roughness': []}
+    _nail_baseline = _baselines[_nail_key]
+
     # 5. STATISTICAL NORMALIZATION (z-score based detection)
-    ridge_deviation = _calculate_deviation(ridge_strength_smoothed, _baseline_ridge_values)
-    roughness_deviation = _calculate_deviation(roughness_smoothed, _baseline_roughness_values)
-    
-    # Update baselines (maintain rolling window of normal values)
-    _update_baseline(_baseline_ridge_values, ridge_strength_smoothed, max_size=30)
-    _update_baseline(_baseline_roughness_values, roughness_smoothed, max_size=30)
+    ridge_deviation    = _calculate_deviation(ridge_strength_smoothed,  _nail_baseline['ridge'])
+    roughness_deviation = _calculate_deviation(roughness_smoothed,       _nail_baseline['roughness'])
+
+    # Update per-nail baselines (maintain rolling window of normal values)
+    _update_baseline(_nail_baseline['ridge'],    ridge_strength_smoothed, max_size=30)
+    _update_baseline(_nail_baseline['roughness'], roughness_smoothed,     max_size=30)
     
     # 6. SCREENING DECISION (flag only persistent, significant deviations)
     screening_result, message = _determine_screening_result(
@@ -158,22 +203,24 @@ def _assess_image_quality(nail_crop: np.ndarray, mask_crop: np.ndarray) -> tuple
     # 2. Resolution (pixel count)
     resolution_score = min(pixel_count / 2500.0, 1.0)  # 50x50 = 2500px minimum
     
-    # 3. Contrast (intensity range)
+    # 3. Contrast (IQR-based — robust to specular highlights)
+    # IQR-based contrast metric is robust to specular highlights.
     pixels = nail_crop[valid_pixels]
-    intensity_range = float(np.max(pixels) - np.min(pixels))
-    contrast_score = min(intensity_range / 120.0, 1.0)  # Need at least 120 range
-    
+    q25, q75   = float(np.percentile(pixels, 25)), float(np.percentile(pixels, 75))
+    iqr        = q75 - q25
+    contrast_score = min(iqr / 60.0, 1.0)
+
     # Overall quality (weighted)
     quality_score = (
         0.5 * sharpness_score +    # Blur is most important
         0.3 * resolution_score +    # Size matters
         0.2 * contrast_score        # Contrast helps but less critical
     )
-    
+
     details = {
         'sharpness': round(laplacian_variance, 1),
         'resolution_pixels': int(pixel_count),
-        'contrast_range': round(intensity_range, 1),
+        'contrast_iqr': round(iqr, 1),
         'sharpness_score': round(sharpness_score, 2),
         'resolution_score': round(resolution_score, 2),
         'contrast_score': round(contrast_score, 2)
@@ -182,57 +229,155 @@ def _assess_image_quality(nail_crop: np.ndarray, mask_crop: np.ndarray) -> tuple
     return quality_score, details
 
 
-def _measure_ridge_strength(nail_crop: np.ndarray, mask_crop: np.ndarray) -> float:
-    """Measure longitudinal ridge prominence using Sobel vertical gradients.
-    
-    Vertical gradients capture the strength of longitudinal (vertical) ridges.
-    Higher values indicate more prominent ridge patterns.
-    
+def _measure_ridge_coherence(
+    nail_crop: np.ndarray,
+    mask_crop: np.ndarray,
+    smooth_sigma: float = 2.0,
+) -> float:
+    """Compute mean structure tensor coherence over valid mask pixels.
+
+    Structure tensor provides advanced ridge orientation coherence metric.
+
+    Coherence ranges from 0 (isotropic / no preferred direction) to 1
+    (perfectly unidirectional ridges).  It is invariant to absolute
+    gradient magnitude and therefore robust to lighting changes.
+
     Args:
-        nail_crop: Grayscale nail region (CLAHE normalized)
-        mask_crop: Binary mask
-    
+        nail_crop:    Grayscale nail region (float or uint8).
+        mask_crop:    Binary mask (>0 = valid).
+        smooth_sigma: Sigma for Gaussian smoothing of tensor components.
+
     Returns:
-        Ridge strength (mean absolute vertical gradient)
+        Mean coherence in [0, 1] over valid pixels.
+    """
+    nail_f = nail_crop.astype(np.float32)
+    Ix = cv2.Sobel(nail_f, cv2.CV_32F, 1, 0, ksize=3)
+    Iy = cv2.Sobel(nail_f, cv2.CV_32F, 0, 1, ksize=3)
+
+    # Structure tensor components
+    Jxx = Ix * Ix
+    Jyy = Iy * Iy
+    Jxy = Ix * Iy
+
+    # Gaussian smoothing of each component (neighbourhood integration)
+    ksize = 0  # let OpenCV derive kernel size from sigma
+    Jxx_s = cv2.GaussianBlur(Jxx, (ksize, ksize), smooth_sigma)
+    Jyy_s = cv2.GaussianBlur(Jyy, (ksize, ksize), smooth_sigma)
+    Jxy_s = cv2.GaussianBlur(Jxy, (ksize, ksize), smooth_sigma)
+
+    # Analytic eigenvalues of a 2×2 symmetric matrix:
+    #   λ1,2 = 0.5 * ( (Jxx+Jyy) ± sqrt((Jxx-Jyy)^2 + 4*Jxy^2) )
+    trace = Jxx_s + Jyy_s
+    diff  = Jxx_s - Jyy_s
+    disc  = np.sqrt(np.maximum(diff * diff + 4.0 * Jxy_s * Jxy_s, 0.0))
+    lambda1 = 0.5 * (trace + disc)   # larger eigenvalue
+    lambda2 = 0.5 * (trace - disc)   # smaller eigenvalue
+
+    # Coherence = (λ1 − λ2) / (λ1 + λ2 + ε)  ∈ [0, 1]
+    coherence = (lambda1 - lambda2) / (lambda1 + lambda2 + 1e-6)
+
+    valid = mask_crop > 0
+    return float(np.mean(coherence[valid]))
+
+
+def _measure_ridge_strength(
+    nail_crop: np.ndarray,
+    mask_crop: np.ndarray,
+    nail_orientation: Optional[float] = None,
+    use_structure_tensor: bool = False,
+) -> float:
+    """Measure longitudinal ridge prominence using orientation-aware Sobel gradients.
+
+    Orientation-aware ridge detection improves robustness to rotated nails.
+
+    When ``use_structure_tensor`` is True, delegates to
+    ``_measure_ridge_coherence`` (structure tensor eigenvalue coherence),
+    which measures directional texture consistency rather than raw gradient
+    magnitude.  Structure tensor provides advanced ridge orientation
+    coherence metric.
+
+    When ``use_structure_tensor`` is False (default), uses the intensity-
+    normalised Sobel projection method — faster and sufficient for most cases.
+
+    When ``nail_orientation`` (radians) is provided (and
+    ``use_structure_tensor`` is False), gradients are projected onto the
+    minor anatomical axis.  When None, falls back to Sobel_y.
+
+    Args:
+        nail_crop:            Grayscale nail region (CLAHE normalized)
+        mask_crop:            Binary mask
+        nail_orientation:     Nail major-axis angle in radians, or None.
+        use_structure_tensor: Use structure tensor coherence metric.
+
+    Returns:
+        Ridge strength as a float (normalised gradient or coherence score).
     """
     valid_pixels = mask_crop > 0
-    
-    # Sobel vertical gradient (detects horizontal edges = longitudinal ridges)
-    sobel_y = cv2.Sobel(nail_crop, cv2.CV_64F, 0, 1, ksize=3)
-    sobel_y_abs = np.abs(sobel_y)
-    
-    # Average gradient strength over valid region
-    ridge_strength = float(np.mean(sobel_y_abs[valid_pixels]))
-    
+
+    # Structure tensor path: coherence metric (flag-gated, not default)
+    if use_structure_tensor:
+        return _measure_ridge_coherence(nail_crop, mask_crop)
+
+    if nail_orientation is not None:
+        # Orientation-aware: project gradient onto the minor (cross-ridge) axis.
+        # major_axis = [cos(θ), sin(θ)]  →  along the nail length
+        # minor_axis = [-sin(θ), cos(θ)] →  across the nail width (ridge direction)
+        cos_t = np.cos(nail_orientation)
+        sin_t = np.sin(nail_orientation)
+        minor_axis_x = -sin_t   # x-component of minor axis
+        minor_axis_y =  cos_t   # y-component of minor axis
+
+        grad_x = cv2.Sobel(nail_crop, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(nail_crop, cv2.CV_64F, 0, 1, ksize=3)
+
+        # Project gradient vector onto minor axis (fully vectorized)
+        ridge_response = np.abs(
+            grad_x * minor_axis_x + grad_y * minor_axis_y
+        )
+    else:
+        # Fallback: Sobel vertical gradient (assumes vertically oriented nail)
+        ridge_response = np.abs(cv2.Sobel(nail_crop, cv2.CV_64F, 0, 1, ksize=3))
+
+    # Intensity-normalized ridge strength improves cross-lighting stability.
+    # Dividing mean gradient by mean pixel intensity removes the dependency on
+    # overall exposure level and CLAHE output magnitude, making the metric
+    # comparable across frames with different lighting conditions.
+    mean_gradient  = float(np.mean(ridge_response[valid_pixels]))
+    mean_intensity = float(np.mean(nail_crop[valid_pixels])) + 1e-6
+    ridge_strength = mean_gradient / mean_intensity
     return ridge_strength
 
 
 def _measure_surface_roughness(nail_crop: np.ndarray, mask_crop: np.ndarray) -> float:
-    """Measure surface roughness using local variance.
-    
-    Local variance captures texture irregularity. Higher values indicate
-    rougher, less uniform surface.
-    
+    """Measure surface roughness using normalised local variance (coefficient of variation).
+
+    Normalized roughness reduces illumination sensitivity.
+
+    Dividing local variance by the squared local mean (coefficient of variation)
+    removes the dependency on absolute pixel intensity, making the metric
+    comparable across frames with different exposure levels.
+
     Args:
         nail_crop: Grayscale nail region (CLAHE normalized)
         mask_crop: Binary mask
-    
+
     Returns:
-        Surface roughness (mean local variance)
+        Surface roughness (mean normalised local variance over valid pixels)
     """
     valid_pixels = mask_crop > 0
     nail_float = nail_crop.astype(np.float32)
-    
+
     # Local mean and variance (5x5 window)
     window_size = 5
     mean_filtered = cv2.blur(nail_float, (window_size, window_size))
-    sq_filtered = cv2.blur(nail_float**2, (window_size, window_size))
-    variance = sq_filtered - mean_filtered**2
+    sq_filtered   = cv2.blur(nail_float ** 2, (window_size, window_size))
+    variance = sq_filtered - mean_filtered ** 2
     variance = np.maximum(variance, 0)  # Handle numerical errors
-    
-    # Average variance over valid region
-    roughness = float(np.mean(variance[valid_pixels]))
-    
+
+    # Normalised variance = variance / (mean² + ε)  →  illumination invariant
+    normalized_variance = variance / (mean_filtered ** 2 + 1e-6)
+
+    roughness = float(np.mean(normalized_variance[valid_pixels]))
     return roughness
 
 
@@ -361,40 +506,64 @@ def _determine_screening_result(
     )
 
 
-def reset_baselines():
-    """Reset baseline tracking (useful when switching between different nails/subjects).
-    
-    Call this when starting analysis of a new nail or new subject to avoid
-    cross-contamination of baseline statistics.
+def reset_baselines(nail_id=None):
+    """Reset baseline tracking.
+
+    When ``nail_id`` is provided, clears only that nail's baseline so its
+    history starts fresh without affecting other nails.  When called with no
+    argument (or ``nail_id=None``), clears ALL per-nail baselines and the
+    shared temporal smoothing buffers — equivalent to the previous behaviour.
+
+    Args:
+        nail_id: Optional nail identifier.  Pass the same value used in
+            ``analyze_nail_texture`` to reset a specific nail's baseline.
     """
-    global _baseline_ridge_values, _baseline_roughness_values
-    _baseline_ridge_values.clear()
-    _baseline_roughness_values.clear()
-    _ridge_history.clear()
-    _roughness_history.clear()
+    global _baselines
+    if nail_id is not None:
+        _nail_key = nail_id
+        if _nail_key in _baselines:
+            _baselines[_nail_key]['ridge'].clear()
+            _baselines[_nail_key]['roughness'].clear()
+    else:
+        # Full reset — backward-compatible behaviour
+        _baselines.clear()
+        _ridge_history.clear()
+        _roughness_history.clear()
 
 
-def get_baseline_stats() -> Dict:
+def get_baseline_stats(nail_id=None) -> Dict:
     """Get current baseline statistics (for debugging/monitoring).
-    
+
+    Args:
+        nail_id: When provided, returns stats for that specific nail only.
+            When None, returns stats for all tracked nails.
+
     Returns:
         Dictionary with baseline means, stds, and sample counts
     """
-    ridge_stats = {
-        'count': len(_baseline_ridge_values),
-        'mean': float(np.mean(_baseline_ridge_values)) if _baseline_ridge_values else 0.0,
-        'std': float(np.std(_baseline_ridge_values)) if _baseline_ridge_values else 0.0
-    }
-    
-    roughness_stats = {
-        'count': len(_baseline_roughness_values),
-        'mean': float(np.mean(_baseline_roughness_values)) if _baseline_roughness_values else 0.0,
-        'std': float(np.std(_baseline_roughness_values)) if _baseline_roughness_values else 0.0
-    }
-    
+    def _stats(values: list) -> dict:
+        return {
+            'count': len(values),
+            'mean':  float(np.mean(values)) if values else 0.0,
+            'std':   float(np.std(values))  if values else 0.0,
+        }
+
+    if nail_id is not None:
+        _nail_key = nail_id if nail_id is not None else '_default'
+        bucket = _baselines.get(_nail_key, {'ridge': [], 'roughness': []})
+        return {
+            'nail_id':          _nail_key,
+            'ridge_baseline':   _stats(bucket['ridge']),
+            'roughness_baseline': _stats(bucket['roughness']),
+        }
+
+    # Return stats for every tracked nail
     return {
-        'ridge_baseline': ridge_stats,
-        'roughness_baseline': roughness_stats
+        nk: {
+            'ridge_baseline':    _stats(bkt['ridge']),
+            'roughness_baseline': _stats(bkt['roughness']),
+        }
+        for nk, bkt in _baselines.items()
     }
 
 

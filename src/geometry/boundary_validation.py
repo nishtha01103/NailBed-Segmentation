@@ -119,3 +119,65 @@ def _canny_validate_edge_at_boundary(
         return 1.0    # Neutral
     else:
         return 0.75   # No edge here -- likely false positive
+
+
+def validate_distal_position(
+    boundary_proj: float,
+    min_proj: float,
+    max_proj: float,
+    end_is_distal: bool = True,
+    debug: bool = False,
+) -> bool:
+    """Anatomical distal-position constraint for free-edge boundary.
+
+    Free edge must lie near distal tip; prevents nail bed misclassification.
+
+    Applied AFTER brightness, gradient, and variance checks pass — this is a
+    final O(1) sanity gate only.  It does not alter the scoring system.
+
+    The check is orientation-aware: ``end_is_distal=True`` means the distal
+    tip is at ``max_proj``; ``end_is_distal=False`` means it is at
+    ``min_proj``.  ``boundary_ratio`` is always computed as distance from the
+    proximal end toward the distal tip, so the threshold is consistent
+    regardless of which physical end is distal.
+
+    Args:
+        boundary_proj:  Boundary projection value along the major axis.
+        min_proj:       Minimum projection value across all nail pixels.
+        max_proj:       Maximum projection value across all nail pixels.
+        end_is_distal:  True  = distal tip is at max_proj (default).
+                        False = distal tip is at min_proj.
+        debug:          When True, prints reason for rejection.
+
+    Returns:
+        True  — boundary passes the anatomical position constraint.
+        False — boundary is rejected (free_edge_present = False,
+                boundary_proj should be set to None by the caller).
+    """
+    span = max_proj - min_proj + 1e-6
+
+    # Normalise boundary position as distance from proximal → distal (0 → 1).
+    if end_is_distal:
+        boundary_ratio = (boundary_proj - min_proj) / span
+    else:
+        boundary_ratio = (max_proj - boundary_proj) / span
+
+    # Step 2: Reject if free edge is not in the distal 25% of nail length.
+    if boundary_ratio < 0.75:
+        if debug:
+            print(
+                f"[DistalCheck] REJECTED: boundary_ratio={boundary_ratio:.3f} < 0.75 "
+                "(not in distal 25% — likely nail-bed misclassification)"
+            )
+        return False  # free_edge_present = False, boundary_proj = None
+
+    # Reject boundaries extremely close to tip (likely mask edge artefact).
+    if boundary_ratio > 0.98:
+        if debug:
+            print(
+                f"[DistalCheck] REJECTED: boundary_ratio={boundary_ratio:.3f} > 0.98 "
+                "(too close to distal tip — likely mask edge artefact)"
+            )
+        return False  # free_edge_present = False
+
+    return True

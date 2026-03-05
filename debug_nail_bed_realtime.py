@@ -30,7 +30,7 @@ from src.geometry_utils import (extract_nail_bed_overlay_data,
                                  _clean_mask_morphology,
                                  _build_curved_bed_mask,
                                  _orient_anatomical_axis)
-from src.color_utils import _detect_polished_nail, _check_lighting_quality
+from src.color_utils import _detect_polished_nail, _check_lighting_quality, extract_nail_color
 from config import (
     MODEL_PATH,
     REALTIME_MASK_THRESHOLD,
@@ -266,6 +266,101 @@ def draw_overlay(frame: np.ndarray, nail_mask: np.ndarray,
     return text_y
 
 
+# ── Metrics overlay ─────────────────────────────────────────────────────────────
+def draw_metrics_overlay(
+    canvas: np.ndarray,
+    data: dict,
+    plate_ratio: float | None,
+    delta_L: float | None,
+    delta_a: float | None,
+    delta_b: float | None,
+    nail_id: int,
+    metrics_y: int,
+) -> int:
+    """Overlay key nail metrics on the video frame using cv2.putText.
+
+    On-frame overlay helps real-time debugging of nail analysis.
+
+    Displays per nail (right-side column):
+        Bed Ratio, Plate Ratio, ΔL, Δa, Δb, Free Edge Status
+
+    Args:
+        canvas:     Frame to draw on (modified in-place).
+        data:       Overlay data dict from extract_nail_bed_overlay_data.
+        plate_ratio: Full-nail PCA length/width ratio (or None).
+        delta_L:    Nail-minus-skin L* difference (or None).
+        delta_a:    Nail-minus-skin a* difference (or None).
+        delta_b:    Nail-minus-skin b* difference (or None).
+        nail_id:    Detection index (for the section header).
+        metrics_y:  Starting y position for this nail's block.
+
+    Returns:
+        Updated metrics_y after writing all lines.
+    """
+    LINE  = 26
+    h, w  = canvas.shape[:2]
+    # Right-side column — leave enough room for the longest line
+    x = max(2, w - 300)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _fmt(val: float | None, decimals: int = 2) -> str:
+        return f"{val:.{decimals}f}" if val is not None else "N/A"
+
+    def _putln(text: str, color: tuple = TEXT_COLOR) -> None:
+        nonlocal metrics_y
+        # Shadow for legibility on any background
+        cv2.putText(canvas, text, (x + 1, metrics_y + 1),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, SHADOW_COLOR, 3, cv2.LINE_AA)
+        cv2.putText(canvas, text, (x, metrics_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color,        2, cv2.LINE_AA)
+        metrics_y += LINE
+
+    # ── section header ────────────────────────────────────────────────────────
+    _putln(f"--- Nail {nail_id} Metrics ---", color=(200, 200, 200))
+
+    # ── Bed Ratio ─────────────────────────────────────────────────────────────
+    _nb_len = data.get("length_px")
+    _nb_wid = data.get("width_px")
+    if _nb_len and _nb_wid and _nb_wid > 0:
+        bed_ratio: float | None = _nb_len / _nb_wid
+    else:
+        bed_ratio = None
+    _bed_color = (0, 255, 0) if bed_ratio is not None else (128, 128, 128)
+    _putln(f"Bed Ratio:   {_fmt(bed_ratio)}", color=_bed_color)
+
+    # ── Plate Ratio ───────────────────────────────────────────────────────────
+    _putln(f"Plate Ratio: {_fmt(plate_ratio)}", color=(0, 255, 180))
+
+    # ── ΔL ────────────────────────────────────────────────────────────────────
+    # Negative ΔL → nail lighter than skin (pallor indicator)
+    _dL_color = (100, 100, 255) if delta_L is not None and delta_L < -5 else (255, 255, 255)
+    _putln(f"\u0394L: {_fmt(delta_L)}", color=_dL_color)
+
+    # ── Δa ────────────────────────────────────────────────────────────────────
+    # Positive Δa → redness / inflammation indicator
+    _da_color = (100, 100, 255) if delta_a is not None and delta_a > 5 else (255, 255, 255)
+    _putln(f"\u0394a: {_fmt(delta_a)}", color=_da_color)
+
+    # ── Δb ────────────────────────────────────────────────────────────────────
+    # Negative Δb → bluish / cyanosis indicator
+    _db_color = (255, 150,  50) if delta_b is not None and delta_b < -5 else (255, 255, 255)
+    _putln(f"\u0394b: {_fmt(delta_b)}", color=_db_color)
+
+    # ── Free Edge Status ──────────────────────────────────────────────────────
+    _fe = data.get("free_edge_present")
+    if _fe is True:
+        fe_str, fe_color = "FREE EDGE: YES", (0, 255, 100)
+    elif _fe is False:
+        fe_str, fe_color = "FREE EDGE: NO",  (180, 180, 180)
+    else:
+        fe_str, fe_color = "FREE EDGE: N/A", (100, 100, 100)
+    _putln(fe_str, color=fe_color)
+
+    # spacing between nails
+    metrics_y += 8
+    return metrics_y
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 # Temporal smoothing: keep last N boundary_proj values per nail slot.
@@ -348,6 +443,16 @@ class AxisSmoother:
 
         # ── Eigen-decomposition on the smoothed covariance ────────────────
         eigvals, eigvecs = np.linalg.eigh(self.cov_smooth)
+        ratio = eigvals[-1] / max(eigvals[0], 1e-6)
+
+        if ratio < 1.15:
+            # Axis ambiguous (near square nail) — keep previous axis
+            if self.ref_major is not None:
+                return (
+                    self.centroid_smooth.copy(),
+                    self.ref_major.copy(),
+                    self.ref_minor.copy(),
+                )
         major = eigvecs[:, -1].astype(np.float64)  # largest eigenvalue
         minor = eigvecs[:, 0].astype(np.float64)
 
@@ -368,7 +473,7 @@ class AxisSmoother:
         # ── Apply anatomical orientation EVERY frame ──────────────────────
         # EMA gives stable vectors.  Orientation corrects direction.
         # These are independent operations — never cache or lock this.
-        major, minor = _orient_anatomical_axis(
+        major, minor, _ = _orient_anatomical_axis(
             image, clean, self.centroid_smooth, major, minor, lab_frame
         )
 
@@ -432,7 +537,8 @@ def main():
         results = model(frame, conf=REALTIME_DETECTION_CONFIDENCE,
                         verbose=False)[0]
 
-        text_y = 35
+        text_y    = 35
+        metrics_y  = 35   # right-column y cursor for draw_metrics_overlay
         valid_nails = 0
         active_slots = set()
 
@@ -590,6 +696,57 @@ def main():
                             data["nail_bed_mask"] = nb_mask
 
                 text_y = draw_overlay(canvas, nail_mask, data, idx, text_y)
+
+                # ── Key metrics overlay (right column) ───────────────────────
+                # On-frame overlay helps real-time debugging of nail analysis.
+
+                # Plate ratio from full-nail PCA eigenvectors
+                _plate_ratio: float | None = None
+                _clean_plate = _clean_mask_morphology(nail_mask)
+                _plate_yx = np.argwhere(_clean_plate == 255)
+                if len(_plate_yx) >= 5:
+                    _plate_xy = _plate_yx[:, ::-1].astype(np.float64)
+                    _plate_ctr = _plate_xy.mean(axis=0)
+                    _plate_cov = np.cov((_plate_xy - _plate_ctr).T)
+                    _plate_ev  = np.linalg.eigvalsh(_plate_cov)
+                    _plate_ratio = float(
+                        np.sqrt(max(_plate_ev[-1], 1e-9) / max(_plate_ev[0], 1e-9))
+                    )
+
+                # Color deltas from skin-referenced LAB analysis
+                _delta_L = _delta_a = _delta_b = None
+                _orient_angle: float | None = (
+                    float(np.arctan2(_sm_maj[1], _sm_maj[0]))
+                    if _sm_maj is not None else None
+                )
+                try:
+                    _lab_c, _bgr_c, _analysis, _ = extract_nail_color(
+                        frame, nail_mask,
+                        nail_id=idx,
+                        nail_orientation=_orient_angle,
+                    )
+                    if _analysis:
+                        _rc = _analysis.get("relative_color") or {}
+                        # delta_L from relative_color is an OpenCV L difference
+                        # (L scale 0-255). Convert to CIE ΔL* (scale 0-100).
+                        # delta_a / delta_b have the 128 offset cancelled already
+                        # and are directly CIE a*/b* differences — no conversion.
+                        _rc_dL   = _rc.get("delta_L")
+                        _delta_L = round(_rc_dL * 100.0 / 255.0, 2) if _rc_dL is not None else None
+                        _delta_a = _rc.get("delta_a")   # CIE Δa*
+                        _delta_b = _rc.get("delta_b")   # CIE Δb*
+                except Exception:
+                    pass  # graceful degradation — metrics stay None
+
+                metrics_y = draw_metrics_overlay(
+                    canvas, data,
+                    plate_ratio=_plate_ratio,
+                    delta_L=_delta_L,
+                    delta_a=_delta_a,
+                    delta_b=_delta_b,
+                    nail_id=idx,
+                    metrics_y=metrics_y,
+                )
 
                 # Show polish/lighting diagnostics on HUD
                 if _auto_polished:

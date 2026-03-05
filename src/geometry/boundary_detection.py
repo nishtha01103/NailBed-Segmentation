@@ -1,569 +1,518 @@
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-"""Adaptive nail bed boundary detection via LAB gradient analysis.
+"""Free-edge boundary detection via profile analysis.
 
-Contains the primary free-edge boundary detector (local derivative method),
-along with helper utilities for profile smoothing and spatial coherence scoring.
+HISTORY OF BUGS AND FIXES (to understand the choices here):
+══════════════════════════════════════════════════════════════════════
+
+v6 ISSUE A (fixed here): Band extends to lunula via dip tolerance
+  Fixed by: no dip tolerance (stop on first below-threshold BWC slice).
+
+v6 ISSUE B (fixed here): Spurious L-drop on < 1 L-unit noise
+  v6 used band_entry_L with budget = 0.8 × L_std_slices.
+  When slices are nearly uniform, L_std_slices ≈ 0.4 → budget ≈ 0.3.
+  This fired on float noise (0.3-unit difference).
+  Fixed by: floor of 4.0: budget = max(4.0, 0.8 × L_std_slices).
+
+v7 ISSUE (introduced and fixed here): Wrong budget base (pixel_L_std)
+  v7 changed to pixel_L_std with 1.2 multiplier → budget = 21-34 units.
+  But actual free-edge → nail-bed slice-mean drop is only 3-8 units.
+  Budget > drop → L-drop never fires → band extends to 89% → REJECTED.
+  Fixed by: reverting to slice-mean L_std (not pixel_L_std).
+
+v7 ISSUE (fixed here): Wrong reference for L-drop (band_entry vs peak)
+  band_entry_L is at the first qualified slice = the transition zone,
+  where slice mean L ≈ mix of bright/dark = lower than peak.
+  This made the limit too low → spurious triggers (v6 Nail 3: 0.3 drop).
+  Fixed by: band_peak_L = rolling max L seen during band traversal.
+  Peak is always at the brightest slice (white tip), well above nail bed.
+
+v7/v8 ISSUE (fixed here): End selection fails when lunula BWC ≈ free edge BWC
+  When both ends have equal BWC (e.g., 0.70 vs 0.70), taper fallback
+  picks wrong end. Band enters at lunula → extends to 89%.
+  Fixed by: combined score = bc × mean_L per end. Free edge = high L + high BWC.
+  Lunula = moderate BWC + much lower mean L. Score correctly separates them.
+
+══════════════════════════════════════════════════════════════════════
+CORRECT FORMULA DERIVATION (from v6 debug data):
+
+  Actual slice-mean L drops at free-edge → nail-bed boundary:
+    Nail 1: 3.7 units,  Nail 4: 5.1 units,  Nail 5: 5.5 units
+  
+  L_std_slices for these nails: 3.0 – 4.0
+  
+  L_drop_budget (SNR-adaptive):
+    SNR = (peak_L − mean_L) / (L_std_slices + 1e-6)
+    SNR >= 1.5  → max(4.0, 0.8 × L_std_slices)   [original, avoids float noise]
+    SNR <  1.5  → max(3.0, 0.6 × L_std_slices)   [softer, for low-contrast nails]
+    - budget = 4.0 for most well-lit nails (floor dominates)
+    - 3.7 drop: band_peak > band_entry, so peak-referenced drop > 4.0 ✓
+    - 0.3 spurious drop: does NOT trigger because 0.3 << 3.0 ✓
+    - dark/flat nails: softer floor detects real 2–3 unit drops ✓
+══════════════════════════════════════════════════════════════════════
 """
 
 from typing import Tuple, Optional
 import cv2
 import numpy as np
-from config import FREE_EDGE_K_SIGMA
+from scipy.ndimage import gaussian_filter1d
 
 
-def _smooth_profile(arr: np.ndarray, window: int = 3) -> np.ndarray:
-    """Vectorised centred moving-average using np.convolve (no Python loop).
+def _region_bright_cov(
+    proj_major: np.ndarray,
+    proj_minor: np.ndarray,
+    L_raw: np.ndarray,
+    bright_thresh: float,
+    r_start: float,
+    r_end: float,
+) -> Tuple[float, float]:
+    """Return (bright_width_cov, mean_L) for pixels in [r_start, r_end)."""
+    mask = (proj_major >= r_start) & (proj_major < r_end)
+    if mask.sum() < 4:
+        return 0.0, 0.0
+    minor_v = proj_minor[mask]
+    L_vals  = L_raw[mask]
+    bright  = L_vals > bright_thresh
+    mL      = float(np.mean(L_vals))
+    if bright.sum() < 4:
+        return 0.0, mL
+    bwc = float(
+        (minor_v[bright].max() - minor_v[bright].min()) /
+        (minor_v.max() - minor_v.min() + 1e-6)
+    )
+    return bwc, mL
 
-    NaN values are handled by replacing them with the local non-NaN mean via
-    a separate weight convolution (equivalent to masked averaging).  This is
-    ~100× faster than the previous per-element Python loop and produces
-    identical results.
-    """
-    if window <= 1:
-        return arr.copy()
-    kernel  = np.ones(window, dtype=np.float64)
-    # Replace NaN with 0 for the value convolution; track valid counts separately.
-    valid   = (~np.isnan(arr)).astype(np.float64)
-    filled  = np.where(np.isnan(arr), 0.0, arr)
-    val_sum = np.convolve(filled, kernel, mode="same")
-    cnt_sum = np.convolve(valid,  kernel, mode="same")
-    # Where no valid neighbours exist keep original (NaN) value.
-    out = np.where(cnt_sum > 0, val_sum / cnt_sum, arr)
-    return out
 
-
-
-def _detect_free_edge_simple(
-    mask: np.ndarray,
-    anatomical_axis: np.ndarray,
-    width_axis: np.ndarray,
-    centroid: np.ndarray,
+def detect_free_edge_boundary(
+    nail_yx: np.ndarray,
+    proj_major: np.ndarray,
+    proj_minor: np.ndarray,
     lab_img: np.ndarray,
-    image: np.ndarray,
-    debug: bool = False
-) -> Tuple[Optional[float], Optional[bool], float]:
-    """
-    Simplified, robust free-edge detector for nail bed boundary.
-    Projects mask pixels onto anatomical axis, analyzes LAB gradient, and returns boundary projection.
-    No strict gating, bins, or multi-condition chains.
-    """
-    nail_yx = np.argwhere(mask == 255)
-    nail_xy = nail_yx[:, ::-1].astype(np.float64)
-    centered = nail_xy - centroid
-    proj_anat = centered @ anatomical_axis
-    min_proj = float(proj_anat.min())
-    max_proj = float(proj_anat.max())
-    axis_span = max_proj - min_proj
-    if axis_span < 10.0:
-        if debug:
-            print("[FreeEdgeSimple] Axis span too small, rejecting.")
-        return None, False, 0.0
-
-    # STEP B: Slice longitudinal profile
-    n_slices = int(np.clip(round(axis_span / 3.0), 40, 60))
-    edges = np.linspace(min_proj, max_proj, n_slices + 1)
-    # Lighting normalization (inside mask only)
-    L_channel = lab_img[:, :, 0]
-    L_vals = L_channel[nail_yx[:, 0], nail_yx[:, 1]].astype(np.float32)
-    mean_L = np.mean(L_vals)
-    std_L = np.std(L_vals) + 1e-6
-    L_norm_img = (L_channel - mean_L) / std_L
-    L_norm_vals = L_norm_img[nail_yx[:, 0], nail_yx[:, 1]]
-    a_vals = lab_img[:, :, 1][nail_yx[:, 0], nail_yx[:, 1]].astype(np.float32)
-    slice_L = np.zeros(n_slices)
-    slice_a = np.zeros(n_slices)
-    for i in range(n_slices):
-        in_slice = (proj_anat >= edges[i]) & (proj_anat < edges[i + 1])
-        if in_slice.sum() < 3:
-            slice_L[i] = np.nan
-            slice_a[i] = np.nan
-            continue
-        slice_L[i] = np.percentile(L_norm_vals[in_slice], 80)
-        slice_a[i] = np.percentile(a_vals[in_slice], 50)
-
-    # Smooth slice_L
-    slice_L = _smooth_profile(slice_L, window=3)
-
-    # STEP C: Compute derivative
-    delta_L = np.diff(slice_L)
-    delta_a = np.diff(slice_a)
-    distal_start = n_slices // 2
-    search_idx = np.arange(distal_start, n_slices - 1)
-
-    # STEP D: Data-driven threshold for distal spike
-    distal_half = delta_L[search_idx]
-    valid_distal = distal_half[~np.isnan(distal_half)]
-    if len(valid_distal) == 0:
-        # STEP G: Trimmed nail detection
-        distal_30 = slice_L[int(0.7 * n_slices):]
-        distal_std = float(np.nanstd(distal_30))
-        if debug:
-            print(f"[FreeEdgeSimple] No valid distal derivatives. Distal std={distal_std:.2f}")
-        if distal_std < 4.0:
-            return None, False, 0.3  # Trimmed nail
-        else:
-            return None, False, 0.5  # Uncertain, no boundary
-    adaptive_thresh = float(np.mean(valid_distal) + 1.5 * np.std(valid_distal))
-    candidates = np.where((delta_L[search_idx] > adaptive_thresh) & (delta_a[search_idx] < 0))[0]
-    if len(candidates) == 0:
-        distal_30 = slice_L[int(0.7 * n_slices):]
-        distal_std = float(np.nanstd(distal_30))
-        if debug:
-            print(f"[FreeEdgeSimple] No candidate. Adaptive threshold={adaptive_thresh:.2f}, Distal std={distal_std:.2f}")
-        if distal_std < 4.0:
-            return None, False, 0.3  # Trimmed nail
-        else:
-            return None, False, 0.5  # Uncertain, no boundary
-
-    # Select slice with maximum delta_L
-    best_idx = search_idx[candidates[np.argmax(delta_L[search_idx][candidates])]]
-    boundary_proj = float(0.5 * (edges[best_idx] + edges[best_idx + 1]))
-    max_delta_L = float(delta_L[best_idx])
-
-    # Color Continuity Check
-    bed_mask = (proj_anat < boundary_proj)
-    free_mask = (proj_anat >= boundary_proj)
-    if np.sum(bed_mask) > 10 and np.sum(free_mask) > 10:
-        mean_a_bed = np.mean(lab_img[:, :, 1][nail_yx[bed_mask, 0], nail_yx[bed_mask, 1]])
-        mean_a_free = np.mean(lab_img[:, :, 1][nail_yx[free_mask, 0], nail_yx[free_mask, 1]])
-        mean_b_bed = np.mean(lab_img[:, :, 2][nail_yx[bed_mask, 0], nail_yx[bed_mask, 1]])
-        mean_b_free = np.mean(lab_img[:, :, 2][nail_yx[free_mask, 0], nail_yx[free_mask, 1]])
-        if abs(mean_a_free - mean_a_bed) > 20 or abs(mean_b_free - mean_b_bed) > 20:
-            if debug:
-                print(f"[FreeEdgeSimple] Color continuity check failed: |a*|={abs(mean_a_free - mean_a_bed):.1f}, |b*|={abs(mean_b_free - mean_b_bed):.1f} > 20, rejecting boundary.")
-            return None, False, 0.0
-
-    # Free edge region width stability check (CRITICAL)
-    free_mask = (proj_anat >= boundary_proj)
-    if np.sum(free_mask) > 0:
-        # Project free region points onto width_axis (minor axis)
-        free_widths = (centered[free_mask] @ width_axis)
-        free_width = free_widths.max() - free_widths.min() if free_widths.size > 0 else 0.0
-        # Full nail width (all mask points)
-        full_widths = (centered @ width_axis)
-        full_nail_width = full_widths.max() - full_widths.min() if full_widths.size > 0 else 1e-6
-        if free_width < 0.5 * full_nail_width:
-            if debug:
-                print(f"[FreeEdgeSimple] Free edge width too narrow: {free_width:.2f} < 0.5 * full_nail_width {full_nail_width:.2f}, rejecting.")
-            return None, False, 0.0
-    # Hard free edge size constraint
-    free_edge_fraction = (max_proj - boundary_proj) / axis_span
-    if free_edge_fraction > 0.20:
-        if debug:
-            print(f"[FreeEdgeSimple] Free edge fraction {free_edge_fraction:.2f} > 0.20, rejecting boundary.")
-        return None, False, 0.0
-    # 4️⃣ Boundary position guard
-    rel_pos = (boundary_proj - min_proj) / axis_span
-    if rel_pos < 0.55 or rel_pos > 0.90:
-        if debug:
-            print(f"[FreeEdgeSimple] Boundary rel_pos={rel_pos:.2f} out of range [0.55, 0.90], rejecting.")
-        return None, False, 0.0
-
-    # Boundary distance from mask extreme constraint
-    # Determine which extreme is distal (assume distal is at max_proj for now)
-    # If you have distal sign logic, adjust accordingly
-    distance_to_extreme = abs(boundary_proj - max_proj)
-    if distance_to_extreme < 0.08 * axis_span:
-        if debug:
-            print(f"[FreeEdgeSimple] Boundary too close to mask extreme: distance={distance_to_extreme:.2f} < 8% axis_span, rejecting.")
-        return None, False, 0.0
-
-    # Glare validation: check mean L before vs after boundary
-    before_idx = max(0, best_idx - 3)
-    after_idx = min(n_slices - 1, best_idx + 3)
-    L_before = np.nanmean(slice_L[before_idx:best_idx])
-    L_after = np.nanmean(slice_L[best_idx:after_idx])
-    delta_L = L_after - L_before
-    # 1️⃣ Reject Extreme Contrast
-    if abs(delta_L) > 35:
-        if debug:
-            print(f"[FreeEdgeSimple] Extreme contrast: |L_after - L_before| = {abs(delta_L):.2f} > 35, rejecting boundary.")
-        return None, False, 0.0
-    if delta_L < 4:
-        if debug:
-            print(f"[FreeEdgeSimple] Glare check failed: L_after - L_before = {delta_L:.2f} < 4, rejecting boundary.")
-        return None, False, 0.0
-
-    # STEP E: Optional Canny reinforcement
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges_img = cv2.Canny(gray, 20, 60)
-    band_mask = (proj_anat >= edges[best_idx] - 5) & (proj_anat <= edges[best_idx] + 5)
-    if band_mask.sum() > 0:
-        edge_density = float(np.mean(edges_img[nail_yx[band_mask, 0], nail_yx[band_mask, 1]] > 0))
-    else:
-        edge_density = 0.0
-    confidence = min(1.0, max_delta_L / 12.0)
-    if edge_density > 0.05:
-        confidence = min(1.0, confidence + 0.15)
-
-    # STEP F: Confidence calculation
-        if max_delta_L < adaptive_thresh:
-            if debug:
-                print(f"[FreeEdgeSimple] max_delta_L < adaptive_thresh ({adaptive_thresh:.2f}), rejecting boundary.")
-            return None, False, 0.0
-
-    if debug:
-        print(f"[FreeEdgeSimple] boundary_proj={boundary_proj:.1f} confidence={confidence:.2f} edge_density={edge_density:.2f}")
-    return boundary_proj, True, confidence
-
-
-def _detect_nail_bed_boundary_canny(
-    mask: np.ndarray,
-    anatomical_axis: np.ndarray,
-    width_axis: np.ndarray,
-    centroid: np.ndarray,
-    image: np.ndarray,
     debug: bool = False,
-) -> Tuple[Optional[float], Optional[bool], float]:
-    # Utility: Enforce Small Free Edge Size after bed mask creation
-    def reject_if_large_free_edge(bed_fraction, debug=False):
-        free_edge_fraction = 1 - bed_fraction
-        if free_edge_fraction > 0.25:
-            if debug:
-                print(f"[BoundaryReject] Free edge fraction {free_edge_fraction:.2f} > 0.25, rejecting boundary.")
-            return True
-        return False
-    """Detect free-edge boundary using Canny edge coverage along anatomical axis."""
-    nail_yx = np.argwhere(mask == 255)
-    nail_xy = nail_yx[:, ::-1].astype(np.float64)
-    centered = nail_xy - centroid
-    proj_anat = centered @ anatomical_axis
-    proj_width = centered @ width_axis
-    min_proj = float(proj_anat.min())
-    max_proj = float(proj_anat.max())
+    major_axis: Optional[np.ndarray] = None,
+) -> Tuple[Optional[float], float, bool]:
+    """Detect the nail-bed / free-edge boundary.
+
+    Gradient energy improves boundary localization under uniform lighting.
+
+    Returns:
+        boundary_proj : inner edge of the bright band (projection units), or None.
+        score         : confidence in [0, 1].
+        end_is_distal : True = free edge at MAX end, False = free edge at MIN end.
+    """
+
+    min_proj  = float(np.min(proj_major))
+    max_proj  = float(np.max(proj_major))
     axis_span = max_proj - min_proj
-    if axis_span < 1.0:
-        return None, True, None, 0.3
-    n_slices = int(np.clip(round(axis_span / 5.0), 30, 70))
-    edges = np.linspace(min_proj, max_proj, n_slices + 1)
-    # Lighting normalization
-    L_channel = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)[:, :, 0]
-    L_mask_vals = L_channel[mask > 0]
-    mean_L = np.mean(L_mask_vals)
-    std_L = np.std(L_mask_vals) + 1e-6
-    L_norm = (L_channel - mean_L) / std_L
-    # Run Canny edge detection once
-    gray_img = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    canny_edges = cv2.Canny(gray_img, threshold1=18, threshold2=55)
-    # For each slice in distal 50%, count edge pixels perpendicular to axis
-    distal_start = n_slices // 2
-    width_coverage_list = []
-    edge_peaks = []
-    slice_widths = []
-    for i in range(distal_start, n_slices):
-        in_slice = (proj_anat >= edges[i]) & (proj_anat < edges[i + 1])
-        if in_slice.sum() < 3:
-            width_coverage_list.append(0.0)
-            edge_peaks.append(0.0)
-            slice_widths.append(np.nan)
-            continue
-        slice_yx = nail_yx[in_slice]
-        slice_proj_width = proj_width[in_slice]
-        min_w = float(slice_proj_width.min())
-        max_w = float(slice_proj_width.max())
-        n_bins = max(10, int(max_w - min_w))
-        bins = np.linspace(min_w, max_w, n_bins + 1)
-        edge_counts = np.zeros(n_bins)
-        for j in range(n_bins):
-            in_bin = (slice_proj_width >= bins[j]) & (slice_proj_width < bins[j + 1])
-            if in_bin.sum() == 0:
-                continue
-            bin_yx = slice_yx[in_bin]
-            edge_count = 0
-            for y, x in bin_yx:
-                if canny_edges[y, x] > 0:
-                    edge_count += 1
-            edge_counts[j] = edge_count
-        # Compute width coverage: percentage of bins with edge pixels
-        width_coverage = float(np.sum(edge_counts > 0)) / max(n_bins, 1)
-        width_coverage_list.append(width_coverage)
-        slice_widths.append(max_w - min_w)
 
-    # External protrusion boundary rejection and boundary position guard
-    boundary_idx = None
-    for idx, coverage in enumerate(width_coverage_list):
-        if coverage > 0.6:
-            boundary_idx = idx + distal_start
-            break
-    if boundary_idx is not None:
-        width_current = slice_widths[boundary_idx - distal_start]
-        width_prev = slice_widths[boundary_idx - distal_start - 1] if boundary_idx - distal_start - 1 >= 0 else width_current
-        if abs(width_current - width_prev) / max(width_current, 1e-6) > 0.35:
-            if debug:
-                print(f"  [BoundaryReject] External protrusion detected: width change {width_current:.2f} vs {width_prev:.2f}, rejecting boundary.")
-            return None, True, False, 0.5
-    if boundary_idx is not None:
-        boundary_proj = float(0.5 * (edges[boundary_idx] + edges[boundary_idx + 1]))
-        rel_pos = (boundary_proj - min_proj) / axis_span
-        if rel_pos < 0.55 or rel_pos > 0.90:
-            if debug:
-                print(f"  [BoundaryReject] Boundary rel_pos={rel_pos:.2f} out of range [0.55, 0.90], rejecting.")
-            return None, True, False, 0.5
-        edge_peaks.append(np.max(edge_counts))
-    # Canny is only used as a reinforcement signal, not for auto-acceptance.
-    # Remove auto-acceptance based on width_coverage. Always return None for boundary.
-    if debug:
-        print("  [CannyBoundary] Canny cannot accept boundary alone. Returning None.")
-    return None, True, False, 0.5
-    _distal_25_start = int(0.75 * n_slices)
-    _distal_25_L     = s_L[_distal_25_start:]
-    _distal_25_valid = _distal_25_L[~np.isnan(_distal_25_L)]
+    if axis_span < 20.0 or len(nail_yx) < 100:
+        return None, 0.0, True
 
-    if len(_distal_25_valid) >= 2:
-        distal_L_std    = float(np.std(_distal_25_valid))
-        _distal_25_diffs = np.diff(_distal_25_valid)
-        max_abs_L_drop  = (
-            float(np.max(np.abs(_distal_25_diffs)))
-            if len(_distal_25_diffs) > 0
-            else 0.0
-        )
-        # New: also require distal region to be short
-        distal_region_length = float(len(_distal_25_valid)) / float(n_slices)
-        if (distal_L_std < 4.0 and max_abs_L_drop < 6.0 and distal_region_length < 0.20):
-            if debug:
-                print(
-                    f"  [NailBed] Short-nail early exit: distal 25% "
-                    f"L std={distal_L_std:.2f} < 4.0, "
-                    f"max |L drop|={max_abs_L_drop:.2f} < 6.0, "
-                    f"distal_region_length={distal_region_length:.2f} < 0.20 "
-                    f"— classified as trimmed"
-                )
-            return None, end_is_distal, False, 0.95
+    # ── Slice profiles ────────────────────────────────────────────────────────
+    N       = int(np.clip(round(axis_span / 5.0), 40, 60))
+    edges   = np.linspace(min_proj, max_proj, N + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
 
-    # =========================================================
-    # LOCAL DERIVATIVE — free-edge detection
-    # =========================================================
+    L_raw     = lab_img[:, :, 0][nail_yx[:, 0], nail_yx[:, 1]].astype(np.float32)
 
-    # STEP 1 — Compute slice-to-slice L derivatives
-    delta_L_arr = np.diff(s_L)
-    delta_a_arr = np.diff(s_a)
-    delta_b_arr = np.diff(s_b)
-    delta_S_arr = np.diff(s_S)  # negative = saturation dropping = toward free edge
-    delta_V_arr = np.diff(s_V)  # positive = brightness rising = toward free edge
+    # ── Vectorised slice profiles (no Python loop) ────────────────────────────
+    _eps     = 1e-6
+    _bin_w   = axis_span / N
+    _bin_idx = np.clip(
+        np.floor((proj_major - min_proj) / _bin_w).astype(np.intp),
+        0, N - 1,
+    )
 
-    # Second derivative of L — sharp transitions have high curvature;
-    # gradual lighting gradients do not.
-    second_delta_L = np.diff(delta_L_arr)
+    _count   = np.bincount(_bin_idx, minlength=N).astype(np.float64)
+    _sum_L   = np.bincount(_bin_idx, weights=L_raw.astype(np.float64), minlength=N)
+    _valid6  = _count >= 6
+    _valid4  = _count >= 4
 
-    # STEP 2 — Single-pass search window: distal 60 %–95 %.
-    # Strictly restricting to this region avoids false positives from
-    # gradual lighting gradients in the proximal/mid nail.
-    SEARCH_START = int(0.60 * n_slices)
-    SEARCH_END   = int(0.95 * n_slices)
+    L_profile  = np.where(_valid6, _sum_L / (_count + _eps), np.nan)
 
-    # FIX 3 — Adaptive threshold computed over DISTAL HALF only.
-    # Computing stats over all slices inflates std when the proximal half
-    # has large cuticle/skin-fold transitions, making the threshold too loose.
-    distal_start_idx = int(0.50 * n_slices)
-    valid_delta_distal = delta_L_arr[distal_start_idx:][~np.isnan(delta_L_arr[distal_start_idx:])]
-    valid_delta_full   = delta_L_arr[~np.isnan(delta_L_arr)]
+    _minor_max = np.full(N, -np.inf)
+    _minor_min = np.full(N,  np.inf)
+    np.maximum.at(_minor_max, _bin_idx, proj_minor)
+    np.minimum.at(_minor_min, _bin_idx, proj_minor)
+    W_profile  = np.where(_valid6, _minor_max - _minor_min, np.nan)
 
-    if len(valid_delta_distal) < 4:   # not enough distal slices — use full axis
-        valid_delta = valid_delta_full
+    L_s = gaussian_filter1d(L_profile, sigma=1.0, mode="nearest")
+    W_s = gaussian_filter1d(W_profile, sigma=1.0, mode="nearest")
+
+    L_mean      = float(np.nanmean(L_s))
+    L_std_s     = float(np.nanstd(L_s)) + 1e-6   # slice-mean std (small, 2–5 units)
+    L_norm      = (L_s - L_mean) / L_std_s
+    W_norm      = W_s / (np.nanmax(W_s) + 1e-6)
+
+    # Raw per-slice mean L for the scan loop (fallback to L_mean for sparse slices)
+    _l_mean_raw = np.where(_valid4, _sum_L / (_count + _eps), L_mean)
+
+    # ── SNR-adaptive L_drop_budget ────────────────────────────────────────────
+    # SNR = (peak slice-mean L − overall mean) / slice-mean std.
+    # High-SNR nails (bright free edge against a darker nail bed) exhibit a
+    # large, reliable L-drop at the free-edge boundary → standard floor=4.0 is
+    # appropriate and avoids spurious triggers from float noise.
+    # Low-contrast nails (dark or flat lighting, SNR < 1.5) have a compressed
+    # luminance range — the true free-edge drop is only 2–3 units, so the
+    # standard floor would prevent detection entirely.  Reducing the floor to
+    # 3.0 and the coefficient to 0.6 preserves sensitivity without raising
+    # false positives because BWC gating (min_slice_bwc) still enforces
+    # geometric evidence of a bright band.
+    # Biological rationale: low-contrast nails require softer drop thresholds.
+    _peak_L = float(np.nanmax(L_s))
+    _snr    = (_peak_L - L_mean) / (L_std_s + 1e-6)
+
+    if _snr < 1.5:
+        # Low-contrast nail: soften the L-drop requirement to avoid missing
+        # a real free edge that produces only a shallow luminance gradient.
+        L_drop_budget = max(3.0, min(0.6 * L_std_s, 12.0))
     else:
-        valid_delta = valid_delta_distal
+        # Standard case: floor=4.0 blocks spurious sub-unit float noise.
+        # Using band_peak_L (not entry) as reference ensures the drop is
+        # measured from the brightest free-edge slice, giving a reliable margin.
+        L_drop_budget = max(4.0, min(0.8 * L_std_s, 12.0))
 
-    # Hardened boundary acceptance: require width_coverage > 0.6 and abs(L_after - L_before) >= 6
-    if canny_width_coverage > 0.6:
-        slice_idx = np.argmin(np.abs(edges - canny_boundary))
-        before_idx = max(0, slice_idx - 3)
-        after_idx = min(n_slices - 1, slice_idx + 3)
-        L_channel = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)[:, :, 0]
-        mask_idx = (proj_anat >= edges[before_idx]) & (proj_anat < edges[after_idx])
-        L_vals = L_channel[nail_yx[:, 0], nail_yx[:, 1]]
-        L_before = np.nanmean(L_vals[mask_idx & (proj_anat < canny_boundary)])
-        L_after = np.nanmean(L_vals[mask_idx & (proj_anat >= canny_boundary)])
-        if abs(L_after - L_before) >= 6:
-            _final_boundary = canny_boundary
-            free_edge_confidence = min(1.0, free_edge_confidence * 1.10)
-            if debug:
-                print(f"  [Voting] Hardened: width_coverage > 0.6 and |L_after-L_before| >= 6 — accepting boundary at {canny_boundary:.1f}")
+    # ── Inclusive bright_thresh ───────────────────────────────────────────────
+    bright_thresh = float(min(np.percentile(L_raw, 70),
+                              L_mean + 0.45 * L_std_s))
 
-    if len(valid_delta) == 0:
-        if debug:
-            print("  [NailBed] No valid derivatives — full mask used")
-        return None, end_is_distal, False, 0.9
+    # ── Vectorised per-slice BWC (precomputed; replaces _slice_bwc closure) ───
+    _bright      = L_raw > bright_thresh
+    _b_idx       = _bin_idx[_bright]
+    _b_minor     = proj_minor[_bright]
+    _b_max       = np.full(N, -np.inf)
+    _b_min       = np.full(N,  np.inf)
+    if _b_idx.size > 0:
+        np.maximum.at(_b_max, _b_idx, _b_minor)
+        np.minimum.at(_b_min, _b_idx, _b_minor)
+    _b_count     = np.bincount(_b_idx, minlength=N).astype(np.float64) if _b_idx.size > 0 else np.zeros(N)
+    _span_all    = np.where(_valid6, _minor_max - _minor_min, 0.0)
+    bwc_profile  = np.where(
+        (_b_count >= 4) & _valid6 & (_span_all > _eps),
+        (_b_max - _b_min) / (_span_all + _eps),
+        0.0,
+    )
 
-    local_mean = float(np.mean(valid_delta))
-    local_std  = float(np.std(valid_delta))
-    adaptive_threshold = local_mean - FREE_EDGE_K_SIGMA * local_std
+    # ── Per-slice intensity variance profile (vectorised) ──────────────────────
+    # Free edge shows lower intensity variance due to translucent keratin.
+    # Variance per slice: Var = E[X²] − E[X]²  (fully vectorised via bincount).
+    _sum_L2      = np.bincount(
+        _bin_idx, weights=(L_raw.astype(np.float64) ** 2), minlength=N
+    )
+    _mean_L_arr  = np.where(_valid6, _sum_L   / (_count + _eps), np.nan)
+    _mean_L2_arr = np.where(_valid6, _sum_L2  / (_count + _eps), np.nan)
+    var_profile  = np.maximum(_mean_L2_arr - _mean_L_arr ** 2, 0.0)
 
-    # FIX 4 — Minimum absolute L-drop floor.
-    # Prevents noise from passing the relative threshold on uniform nails.
-    # A real nail-bed / free-edge transition is always ≥ 7 LAB-L units.
-    MIN_ABS_DROP = -7.0
-    adaptive_threshold = min(adaptive_threshold, MIN_ABS_DROP)
+    # Baseline variance: median of proximal half (stable nail-bed region).
+    # Floor at 1.0 to avoid division noise on uniform/dark regions.
+    _prox_half   = var_profile[: N // 2]
+    _base_finite = _prox_half[np.isfinite(_prox_half)]
+    baseline_var = float(np.median(_base_finite)) if _base_finite.size > 0 else 1.0
+    baseline_var = max(baseline_var, 1.0)
+    # Per-slice ratio: free-edge slices should be < 0.6 (translucent keratin)
+    variance_ratio = var_profile / (baseline_var + _eps)
+
+    # ── LAB gradient energy per slice (vectorised) ────────────────────────────
+    # Gradient energy improves boundary localization under uniform lighting.
+    # Compute Sobel gradients on L channel and project onto major axis direction.
+    # Used only as a supporting signal (never standalone).
+    grad_profile = np.zeros(N, dtype=np.float64)
+    if major_axis is not None:
+        L_img = lab_img[:, :, 0].astype(np.float32)
+        grad_x = cv2.Sobel(L_img, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(L_img, cv2.CV_32F, 0, 1, ksize=3)
+
+        # Project gradient vector onto major axis for each nail pixel
+        gx_vals = grad_x[nail_yx[:, 0], nail_yx[:, 1]]
+        gy_vals = grad_y[nail_yx[:, 0], nail_yx[:, 1]]
+        # Gradient magnitude projected onto major axis
+        grad_mag = np.abs(gx_vals * major_axis[0] + gy_vals * major_axis[1])
+
+        # Aggregate gradient magnitude per slice using same binning
+        _grad_sum = np.bincount(_bin_idx, weights=grad_mag.astype(np.float64), minlength=N)
+        grad_profile = np.where(_valid6, _grad_sum / (_count + _eps), 0.0)
+        grad_profile = gaussian_filter1d(grad_profile, sigma=1.0, mode="nearest")
+
+    # Normalize gradient energy to 0–1
+    _grad_max = float(np.max(grad_profile))
+    grad_norm = grad_profile / (_grad_max + _eps) if _grad_max > _eps else grad_profile
+
+    # ── Combined-score end selection ──────────────────────────────────────────
+    # score = BWC × mean_L per end.  Free edge = high BWC AND high L.
+    # Lunula = similar BWC but meaningfully lower L.  Score separates them.
+    distal_frac = 0.30
+    bc_max, mL_max = _region_bright_cov(proj_major, proj_minor, L_raw, bright_thresh,
+                                        max_proj - distal_frac * axis_span, max_proj)
+    bc_min, mL_min = _region_bright_cov(proj_major, proj_minor, L_raw, bright_thresh,
+                                        min_proj, min_proj + distal_frac * axis_span)
+
+    score_max = bc_max * mL_max
+    score_min = bc_min * mL_min
+
+    # Taper orientation as fallback when both ends indistinct
+    ef           = max(3, int(0.20 * N))
+    taper_diff   = np.nanmean(W_norm[:ef]) - np.nanmean(W_norm[-ef:])
+    taper_distal = taper_diff > 0
+
+    bc_diff = abs(bc_max - bc_min)
+    # Override taper ONLY when BWC clearly differs between ends (>= 0.12).
+    # Mean-L alone is unreliable: the lunula can be as bright as the free edge.
+    # A 0.12 BWC gap is a real geometric signal; a 0.01-0.02 gap is noise.
+    if bc_diff >= 0.12:
+        end_is_distal = score_max > score_min
+        if debug and end_is_distal != taper_distal:
+            print(f"[BoundaryDetect] Brightness overrides taper: "
+                  f"bc_max={bc_max:.2f}(mL={mL_max:.0f}) "
+                  f"bc_min={bc_min:.2f}(mL={mL_min:.0f})  "
+                  f"scores: {score_max:.0f} vs {score_min:.0f}")
+    else:
+        end_is_distal = taper_distal
+
+    # ── Region classification ─────────────────────────────────────────────────
+    if end_is_distal:
+        ds, de     = max_proj - distal_frac * axis_span, max_proj
+        bright_cov = bc_max
+    else:
+        ds, de     = min_proj, min_proj + distal_frac * axis_span
+        bright_cov = bc_min
+
+    cs = min_proj + 0.30 * axis_span
+    ce = cs + 0.40 * axis_span
+    in_d = (proj_major >= ds) & (proj_major < de)
+    in_c = (proj_major >= cs) & (proj_major < ce)
+
+    if in_d.sum() < 10 or in_c.sum() < 10:
+        return None, 0.0, end_is_distal
+
+    delta_L_region = float(np.mean(L_raw[in_d]) - np.mean(L_raw[in_c]))
+
+    # NOTE: No delta_L guard here. A negative delta_L on the selected end is
+    # NOT reliable evidence of wrong end selection. When the free edge occupies
+    # only 15-20% of the nail, the 30% classification window mixes free-edge
+    # and nail-bed pixels, dragging the regional mean_L below the central mean.
+    # A threshold-based flip on delta_L < -8 breaks correctly-oriented nails
+    # (tested: image 2 nails 3 and 5 both had taper=correct but guard flipped
+    # them to the wrong end). Nails where the guard appeared to help (image 2
+    # nail 1) return None with or without the guard — the scan still exceeds
+    # the free_edge_frac limit in either orientation. Safe to omit entirely.
+
+    # ── Region score ──────────────────────────────────────────────────────────
+    adaptive_denom = max(2.5, 1.5 * L_std_s)
+    delta_score    = np.clip(delta_L_region / adaptive_denom, 0, 1)
+    bwc_score      = np.clip(bright_cov / 0.55, 0, 1)
+
+    # Gradient energy in the distal band (normalised 0–1)
+    _d_mask_grad = (proj_major >= ds) & (proj_major < de)
+    if _d_mask_grad.sum() >= 6 and _grad_max > _eps:
+        _d_bin_idx = _bin_idx[_d_mask_grad]
+        _d_grad_vals = grad_norm[_d_bin_idx]
+        gradient_score = float(np.clip(np.mean(_d_grad_vals), 0, 1))
+    else:
+        gradient_score = 0.0
+
+    # Variance score: fraction of distal-band slices with variance_ratio < 0.6.
+    # Translucent free-edge keratin shows markedly lower intensity variance.
+    _d_mask_var = (proj_major >= ds) & (proj_major < de)
+    if _d_mask_var.sum() >= 6:
+        _d_bin_var   = _bin_idx[_d_mask_var]
+        _d_var_vals  = variance_ratio[np.clip(_d_bin_var, 0, N - 1)]
+        _finite_mask = np.isfinite(_d_var_vals)
+        if _finite_mask.sum() >= 3:
+            variance_score = float(np.clip(
+                np.mean(_d_var_vals[_finite_mask] < 0.6), 0, 1
+            ))
+        else:
+            variance_score = 0.5  # neutral — insufficient data
+    else:
+        variance_score = 0.5  # neutral — insufficient data
+
+    # Combined score: L-drop + BWC + gradient energy + variance signal
+    region_score = (
+        0.4 * delta_score +
+        0.3 * bwc_score +
+        0.2 * gradient_score +
+        0.1 * variance_score
+    )
 
     if debug:
-        print(
-            f"  [NailBed] local_mean={local_mean:.3f}  local_std={local_std:.3f}  "
-            f"adaptive_threshold={adaptive_threshold:.3f}"
-        )
+        print(f"[BoundaryDetect] region_score={region_score:.2f}  "
+              f"delta_L={delta_L_region:.1f}  bright_cov={bright_cov:.2f}  "
+              f"gradient={gradient_score:.2f}  variance={variance_score:.2f}  "
+              f"bc_max={bc_max:.2f}(mL={mL_max:.0f}) bc_min={bc_min:.2f}(mL={mL_min:.0f})  "
+              f"bright_thresh={bright_thresh:.1f}  end_is_distal={end_is_distal}")
 
-    def _scan_candidates(start: int, end: int) -> list:
-        """Return candidate slice indices (distal-to-proximal) in [start, end).
+    if region_score < 0.28:
+        return None, 0.0, end_is_distal
 
-        IMPORTANT: The free edge is BRIGHTER than the nail bed (white/translucent
-        tip vs pink vascularised bed).  Going proximal→distal across the boundary,
-        L INCREASES (positive spike), a* DECREASES (less pink), saturation DROPS.
+    # ── Adaptive per-slice BWC thresholds ─────────────────────────────────────
+    min_slice_bwc   = float(np.clip(0.82 * bright_cov, 0.35, 0.55))
+    inner_threshold = float(max(0.33, 0.60 * bright_cov))
 
-        The original code only looked for a NEGATIVE delta_combined, which would
-        only fire if the free edge were darker than the nail bed — the opposite of
-        reality for top-down nail photography.
+    if debug:
+        print(f"[BoundaryDetect] min_slice_bwc={min_slice_bwc:.2f}  "
+              f"inner_threshold={inner_threshold:.3f}  "
+              f"L_drop_budget={L_drop_budget:.2f}  L_std_s={L_std_s:.2f}")
 
-        Fix: detect ANY sharp spike (positive or negative) using abs().
-        The redness check in the evaluation loop confirms the anatomical direction:
-          a_before (nail bed, pink) > a_after (free edge, white) → correct boundary.
-        """
-        cands = []
-        abs_threshold = abs(adaptive_threshold)
-        for idx in range(end, start, -1):
-            if np.isnan(delta_L_arr[idx]):
-                continue
-            _dS = delta_S_arr[idx] if idx < len(delta_S_arr) else 0.0
-            _db = delta_b_arr[idx] if idx < len(delta_b_arr) else 0.0
-            _da = delta_a_arr[idx] if idx < len(delta_a_arr) else 0.0
+    # ── Slice search ──────────────────────────────────────────────────────────
+    margin       = 3
+    search_range = (range(N - margin - 1, margin, -1) if end_is_distal
+                    else range(margin, N - margin - 1))
 
-            # Combined multi-channel gradient signal.
-            # At the nail-bed → free-edge transition (proximal→distal):
-            #   delta_L > 0  (L rises — free edge is brighter)
-            #   delta_a < 0  (a* drops — less pink/red)
-            #   delta_S < 0  (saturation drops — free edge is white/neutral)
-            # We build a signed "free-edge score" and threshold its ABSOLUTE value.
-            # Sign convention: positive = free-edge-like transition.
-            delta_combined = (
-                delta_L_arr[idx]       # +ve when L rises toward free edge
-                - 0.5 * _da            # +ve when a* drops (less red)
-                - 0.3 * _db            # +ve when b* drops (less yellow)
-                - 0.004 * _dS          # +ve when saturation drops
-            )
-            # Accept if the magnitude exceeds the adaptive threshold.
-            # The redness check below then confirms anatomical direction.
-            if abs(delta_combined) > abs_threshold:
-                cands.append(idx)
-        return cands
+    band_inner_idx    = None
+    band_outer_idx    = None
+    best_score        = 0.0
+    in_band           = False
+    band_peak_L       = -np.inf   # rolling max slice-mean L (confirmed free-edge slices only)
+    last_good_idx     = None
+    l_drop_consec     = 0         # consecutive slices below L-drop limit
 
-    # STEP 3 — Gather candidates (single pass: 60 %–95 %)
-    candidates = _scan_candidates(SEARCH_START, SEARCH_END)
-
-    # STEP 4 — Evaluate each candidate until one is confirmed
-    free_edge_present    = False
-    free_edge_confidence = 0.9
-    boundary_proj        = None
-
-    WIN        = 5
-    A_TOLERANCE = 0.5
-
-    # Relaxed boundary position guard: allow 0.55–0.95
-    MIN_BED_FRACTION = 0.55
-    MAX_BED_FRACTION = 0.95
-
-    for i in candidates:
-        # Boundary position guard: the cut point must lie in [60 %, 95 %].
-        rel_pos = (i + 0.5) / n_slices   # 0 = proximal, 1 = distal
-        if rel_pos < MIN_BED_FRACTION or rel_pos > MAX_BED_FRACTION:
-            if debug:
-                print(f"  [NailBed] Candidate {i} rejected by position guard "
-                      f"(rel_pos={rel_pos:.2f} outside [{MIN_BED_FRACTION}, {MAX_BED_FRACTION}])")
+    for i in search_range:
+        if i < 4 or i + 4 >= N:
             continue
 
-        a_before = (
-            float(np.nanmean(s_a[max(0, i - WIN):i]))
-            if i > 0 else float(s_a[0])
+        delta_L_s  = np.nanmean(L_norm[i:i + 4]) - np.nanmean(L_norm[i - 4:i])
+        width_drop = (W_norm[i - 4] - W_norm[i]) / (W_norm[i - 4] + 1e-6)
+
+        slice_score = (
+            0.65 * np.clip(delta_L_s  / 0.6,  0, 1) +
+            0.35 * np.clip(width_drop / 0.25, 0, 1)
         )
-        a_after = float(s_a[min(i + 1, n_slices - 1)])
+        bwc_here = float(bwc_profile[i])
+        slice_L  = float(_l_mean_raw[i])
 
-        redness_confirmed = (a_before - a_after) >= -A_TOLERANCE
-
-        if redness_confirmed:
-            # Relaxed second derivative threshold
-            if i >= 1 and (i - 1) < len(second_delta_L):
-                if abs(second_delta_L[i - 1]) <= 2.0:
-                    if debug:
-                        print(f"  [NailBed] Candidate {i} rejected: second derivative "
-                              f"{abs(second_delta_L[i - 1]):.2f} <= 2.0")
-                    continue
-
-            # Saturation/brightness confirmation.
-            # At the free edge: saturation drops (white tip) OR L changes sharply.
-            # Accept if saturation drops meaningfully OR |delta_L| is large.
-            if i < len(delta_S_arr):
-                if not (delta_S_arr[i] < -4.0 or abs(delta_L_arr[i]) > 10.0):
-                    if debug:
-                        print(f"  [NailBed] Candidate {i} rejected: saturation/brightness "
-                              f"delta_S={delta_S_arr[i]:.2f}, delta_L={delta_L_arr[i]:.2f} (not desaturated or bright enough)")
-                    continue
-
-            next_i        = min(i + 1, n_slices - 1)
-            boundary_proj_candidate = float(0.5 * (s_centers[i] + s_centers[next_i]))
-            # Lowered coherence threshold: require >= 0.55
-            coherence = _boundary_coherence_score(
-                mask, centroid, major_axis, minor_axis,
-                proj_major, proj_minor, nail_yx,
-                boundary_proj_candidate, lab_img, width=10
-            )
-            if coherence < 0.55:
-                if debug:
-                    print(f"  [NailBed] Candidate {i} rejected by coherence ({coherence:.2f} < 0.55)")
+        if not in_band:
+            if slice_score < 0.20 or bwc_here < min_slice_bwc:
                 continue
-            # Lateral coverage check: boundary must span ≥ 35 % of nail width
-            _near_bd = (
-                (proj_major >= boundary_proj_candidate - 5) &
-                (proj_major <= boundary_proj_candidate + 5)
-            )
-            if _near_bd.sum() >= 3:
-                _w_at_bd   = float(
-                    np.percentile(proj_minor[_near_bd], 95) -
-                    np.percentile(proj_minor[_near_bd], 5)
-                )
-                _total_w   = float(proj_minor.max() - proj_minor.min())
-                if _total_w > 0 and (_w_at_bd / _total_w) < 0.35:
+            in_band        = True
+            band_outer_idx = i
+            band_inner_idx = i
+            last_good_idx  = i
+            band_peak_L    = slice_L
+            l_drop_consec  = 0
+            best_score     = slice_score
+        else:
+            # L-drop guard: requires 2 consecutive below-limit slices.
+            # A single dip (shadow, curvature, noise) within the free edge
+            # drops below peak-budget but recovers on the next slice.
+            # A real nail-bed entry stays dark for 2+ slices.
+            # Peak is only updated on confirmed non-dip slices to keep the
+            # reference anchored at the brightest true free-edge point.
+            if slice_L < band_peak_L - L_drop_budget:
+                l_drop_consec += 1
+                if l_drop_consec >= 2:
                     if debug:
-                        print(f"  [NailBed] Candidate {i} rejected: lateral coverage "
-                              f"{_w_at_bd / _total_w:.0%} < 35%")
-                    continue
-            boundary_proj = boundary_proj_candidate
-            free_edge_present    = True
-            # Confidence based on magnitude of the brightness jump, not signed value
-            free_edge_confidence = min(
-                1.0, abs(delta_L_arr[i]) / max(abs(adaptive_threshold), 1e-6)
-            )
-            if debug:
-                print(
-                    f"  [NailBed] Free edge detected: slice={i}/{n_slices}  "
-                    f"boundary_proj={boundary_proj:.1f}  "
-                    f"confidence={free_edge_confidence:.2f}  "
-                    f"delta_L={delta_L_arr[i]:.2f}  "
-                    f"a_before={a_before:.1f}  a_after={a_after:.1f}"
-                )
-            break
-        else:
-            if debug:
-                print(
-                    f"  [NailBed] Candidate slice {i} failed redness "
-                    f"(a_before={a_before:.1f}  a_after={a_after:.1f}) — trying next"
-                )
+                        print(f"[BoundaryDetect] L-drop stop at slice {i}: "
+                              f"slice_L={slice_L:.1f} < peak {band_peak_L:.1f} - {L_drop_budget:.2f}")
+                    if last_good_idx is not None:
+                        band_inner_idx = last_good_idx
+                    break
+                # Single dip — don't stop, don't update peak
+                continue
+            else:
+                # Recovered from dip (or never dipped)
+                l_drop_consec = 0
+                band_peak_L   = max(band_peak_L, slice_L)
 
-    # STEP 5 — No qualifying candidate → short / trimmed nail
-    if not free_edge_present:
-        # Check if this is a genuinely short/trimmed nail (L profile flat in distal region)
-        _distal_L_std = float(np.nanstd(s_L[int(0.6 * n_slices):]))
-        if _distal_L_std < 5.0:
-            # Very uniform distal region = genuinely trimmed nail, not a detection failure
-            # Report high confidence that free edge is ABSENT
-            free_edge_confidence = 0.88
-            if debug:
-                print(f"  [NailBed] Confirmed short/trimmed nail "
-                      f"(distal L std={_distal_L_std:.2f})")
+            # No dip tolerance on BWC: stop on first below-threshold slice.
+            if bwc_here >= inner_threshold:
+                band_inner_idx = i
+                last_good_idx  = i
+                best_score     = max(best_score, slice_score)
+            else:
+                if last_good_idx is not None:
+                    band_inner_idx = last_good_idx
+                break
+
+    if band_inner_idx is None:
+        if region_score > 0.75:
+            shift    = 0.05 * axis_span
+            fallback = max_proj - shift if end_is_distal else min_proj + shift
+            return float(fallback), 0.45, end_is_distal
+        return None, 0.0, end_is_distal
+
+    # ── Variance 3-consecutive-slices confidence check ────────────────────────
+    # Ensure variance condition holds for at least 3 consecutive slices
+    # before confirming free-edge boundary.
+    # A single low-variance slice can be noise; sustained low variance over
+    # 3+ slices is consistent with translucent keratin.
+    if band_outer_idx is not None and band_inner_idx is not None:
+        _blo = min(band_outer_idx, band_inner_idx)
+        _bhi = max(band_outer_idx, band_inner_idx) + 1
+        _band_vr  = variance_ratio[_blo:_bhi]
+        _low_mask = np.isfinite(_band_vr) & (_band_vr < 0.6)
+        # Find max consecutive run of True values (vectorised)
+        if _low_mask.size > 0 and _low_mask.any():
+            _padded  = np.concatenate(([False], _low_mask, [False]))
+            _diff    = np.diff(_padded.astype(np.int8))
+            _starts  = np.where(_diff == 1)[0]
+            _ends    = np.where(_diff == -1)[0]
+            _max_run = int(np.max(_ends - _starts)) if _starts.size > 0 else 0
         else:
-            # Uncertain: gradient exists but no candidate passed all checks
-            free_edge_confidence = 0.45
+            _max_run = 0
+        if _max_run < 3:
+            # Variance criterion not sustained — treat as weaker detection
+            best_score = best_score * 0.7
+            if debug:
+                print(f"[BoundaryDetect] Variance run={_max_run} < 3 — "
+                      f"score penalised to {best_score:.2f}")
+
+    # ── Band continuity check (single-slice band) ─────────────────────────────
+    if band_outer_idx == band_inner_idx:
+        check_idxs = (
+            [band_inner_idx - 1, band_inner_idx - 2, band_inner_idx - 3]
+            if end_is_distal else
+            [band_inner_idx + 1, band_inner_idx + 2, band_inner_idx + 3]
+        )
+        neighbour_hits = sum(
+            1 for j in check_idxs if 0 <= j < N and bwc_profile[j] > 0.22
+        )
+        if neighbour_hits < 1 and region_score < 0.65:
+            return None, 0.0, end_is_distal
+
+    boundary_proj = float(centers[band_inner_idx])
+
+    # ── Minimum free-edge length validation ───────────────────────────────────
+    # Rejects thin reflection bands falsely detected as free edge.
+    distal_proj      = max_proj if end_is_distal else min_proj
+    nail_length      = max_proj - min_proj
+    free_edge_length = abs(distal_proj - boundary_proj)
+    free_edge_ratio  = free_edge_length / (nail_length + 1e-6)
+
+    if free_edge_ratio < 0.05:
         if debug:
-            print(
-                f"  [NailBed] No confirmed boundary from {len(candidates)} candidate(s) "
-                "— short nail, full mask used"
-            )    
+            print(f"[BoundaryDetect] REJECTED: free_edge_ratio={free_edge_ratio:.3f} < 0.05 "
+                  "(thin reflection band)")
+        free_edge_present = False  # noqa: F841  (documents intent for callers)
+        boundary_proj     = None
+        return None, 0.0, end_is_distal
 
-    return boundary_proj, end_is_distal, free_edge_present, free_edge_confidence
+    # ── Free-edge-fraction constraint ────────────────────────────────────────
+    free_edge_frac = (
+        (max_proj - boundary_proj) / axis_span if end_is_distal
+        else (boundary_proj - min_proj) / axis_span
+    )
+
+    if free_edge_frac > 0.45:
+        if free_edge_frac <= 0.55 and region_score >= 0.40:
+            if debug:
+                print(f"[BoundaryDetect] Clamping free_edge_frac {free_edge_frac:.2f} → 0.45")
+            boundary_proj = (max_proj - 0.45 * axis_span if end_is_distal
+                             else min_proj + 0.45 * axis_span)
+            free_edge_frac = 0.45
+        else:
+            if debug:
+                print(f"[BoundaryDetect] REJECTED: free_edge_frac={free_edge_frac:.2f} > 0.55"
+                      " (band reached proximal region)")
+            return None, 0.0, end_is_distal
+
+    elif free_edge_frac < 0.05:
+        if free_edge_frac >= 0.02 and region_score >= 0.40:
+            boundary_proj = (max_proj - 0.05 * axis_span if end_is_distal
+                             else min_proj + 0.05 * axis_span)
+            free_edge_frac = 0.05
+        else:
+            return None, 0.0, end_is_distal
+
+    if debug:
+        print(f"[BoundaryDetect] ACCEPTED boundary={boundary_proj:.2f}  "
+              f"free_edge_frac={free_edge_frac:.2f}  score={best_score:.2f}")
+
+    return float(boundary_proj), float(min(best_score, 1.0)), end_is_distal

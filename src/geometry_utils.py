@@ -18,7 +18,7 @@ from .geometry import (                         # noqa: F401
     # Axis orientation
     _orient_anatomical_axis,
     # Boundary detection
-    _smooth_profile,
+    # _smooth_profile,  # Removed: does not exist
     # Boundary estimators
     _kmeans_boundary_estimate,
     _otsu_boundary_estimate,
@@ -26,11 +26,12 @@ from .geometry import (                         # noqa: F401
     # Boundary validation
     _otsu_validate_color_boundary,
     _canny_validate_edge_at_boundary,
+    # Boundary detection
+    detect_free_edge_boundary,
     # Bed mask builder
+    _ransac_curved_boundary,
     _build_curved_bed_mask,
     # Pipeline
-    _detect_free_edge_by_brightness,
-    _boundary_from_free_edge_mask,
     _extract_nail_bed_internal,
     extract_geometry_nail_bed,
     extract_geometry_nail_bed_with_diagnostics,

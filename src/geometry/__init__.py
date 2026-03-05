@@ -20,9 +20,10 @@ from .pca_utils import (
 from .axis_orientation import _orient_anatomical_axis
 
 # --- Adaptive boundary detection (LAB gradient) ---
-from .boundary_detection import (
-    _smooth_profile,
-)
+from .boundary_detection import detect_free_edge_boundary
+
+# --- Bed-mask RANSAC helper (exposed for testing) ---
+from .bed_mask_builder import _ransac_curved_boundary
 
 # --- Alternative boundary estimators ---
 from .boundary_estimators import (
@@ -42,8 +43,6 @@ from .bed_mask_builder import _build_curved_bed_mask
 
 # --- End-to-end pipeline & public entry points ---
 from .pipeline import (
-    _detect_free_edge_by_brightness,
-    _boundary_from_free_edge_mask,
     _extract_nail_bed_internal,
     extract_geometry_nail_bed,
     extract_geometry_nail_bed_with_diagnostics,
@@ -61,8 +60,8 @@ __all__ = [
     # Axis orientation
     "_orient_anatomical_axis",
     # Boundary detection
-    "_detect_nail_bed_boundary_adaptive",
-    "_smooth_profile",
+    # "_detect_nail_bed_boundary_adaptive",  # Removed: does not exist
+    # "_smooth_profile",  # Removed: does not exist
     # Boundary estimators
     "_kmeans_boundary_estimate",
     "_otsu_boundary_estimate",
@@ -71,10 +70,12 @@ __all__ = [
     "_otsu_validate_color_boundary",
     "_canny_validate_edge_at_boundary",
     # Bed mask builder
+    "_ransac_curved_boundary",
     "_build_curved_bed_mask",
+    # Boundary detection
+    "detect_free_edge_boundary",
     # Pipeline
-    "_detect_free_edge_by_brightness",
-    "_boundary_from_free_edge_mask",
+        # Removed pipeline functions
     "_extract_nail_bed_internal",
     "extract_geometry_nail_bed",
     "extract_geometry_nail_bed_with_diagnostics",
