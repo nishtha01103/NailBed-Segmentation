@@ -3,16 +3,17 @@
 Real-time and static-image nail segmentation, geometry measurement, and color analysis using YOLOv8-seg. Designed for medical-grade nail morphology screening.
 
 ---
+<img width="960" height="1280" alt="output4" src="https://github.com/user-attachments/assets/570ceb49-b997-4987-a90c-2213999773a0" />
 
 ## Project Overview
 
 The system detects and segments individual fingernails from a webcam feed or a still image, then extracts:
 
-- **Nail-bed geometry** — length, width, area (px and mm), shape ratio, free-edge boundary
-- **Full-nail geometry** — stabilized length/width from PCA, directional aspect ratio
-- **Color** — CIE LAB and BGR per nail, with SSR illumination normalization
-- **Texture** — ridge density, roughness, pitting (configurable sensitivity)
-- **Tilt detection** — rejects measurements when the finger is not flat to the camera
+- **Nail-bed geometry** â€” length, width, area (px and mm), shape ratio, free-edge boundary
+- **Full-nail geometry** â€” stabilized length/width from PCA, directional aspect ratio
+- **Color** â€” CIE LAB and BGR per nail, with SSR illumination normalization
+- **Texture** â€” ridge density, roughness, pitting (configurable sensitivity)
+- **Tilt detection** â€” rejects measurements when the finger is not flat to the camera
 
 Two operating modes share the same underlying analysis modules:
 
@@ -27,8 +28,8 @@ Two operating modes share the same underlying analysis modules:
 
 ```
 Nail_Segmentation/
- main.py                    # Entry point — static image analysis
- realtime.py                # Entry point — live webcam analysis
+ main.py                    # Entry point â€” static image analysis
+ realtime.py                # Entry point â€” live webcam analysis
  config.py                  # All tuneable parameters
  requirements.txt           # Python dependencies
  README.md                  # This file
@@ -111,7 +112,7 @@ Every detected nail is returned as a dictionary. The most medically relevant fie
 | Field | Type | Description |
 |-------|------|-------------|
 | `nail_id` | int | Detection index in the frame |
-| `shape_ratio` | float | **Primary ratio** — nail-bed length/width (nail-bed preferred; full-nail fallback) |
+| `shape_ratio` | float | **Primary ratio** â€” nail-bed length/width (nail-bed preferred; full-nail fallback) |
 | `aspect_ratio` | float | Full-nail length/width from stabilized PCA (debug reference) |
 | `length_mm` | float | Full-nail PCA length, stabilized over 7 frames |
 | `width_mm` | float | Full-nail PCA width, stabilized over 7 frames |
@@ -121,10 +122,10 @@ Every detected nail is returned as a dictionary. The most medically relevant fie
 | `nail_bed_area_mm2` | float | Nail-bed area |
 | `nail_bed_aspect_ratio` | float | Nail-bed length/width ratio |
 | `nail_bed_free_edge_present` | bool | Whether free edge was confidently detected |
-| `nail_bed_free_edge_confidence` | float | Confidence of free-edge detection (0–1) |
+| `nail_bed_free_edge_confidence` | float | Confidence of free-edge detection (0â€“1) |
 | `boundary_methods_count` | int | Number of independent methods that agreed on the boundary |
 | `boundary_confidence` | float | Combined boundary detection confidence |
-| `nail_color_LAB` | list[float] | Median nail color [L, a, b] (OpenCV 0–255 scale) |
+| `nail_color_LAB` | list[float] | Median nail color [L, a, b] (OpenCV 0â€“255 scale) |
 | `nail_color_BGR` | list[int] | Median nail color [B, G, R] |
 | `nail_color_HEX` | str | Hex color string `#RRGGBB` |
 | `tilt_info` | dict | Tilt detection result (`likely_tilted`, `confidence`) |
@@ -159,7 +160,7 @@ Every detected nail is returned as a dictionary. The most medically relevant fie
 |-----------|---------|-------------|
 | `ENABLE_RETINEX` | True | Single-Scale Retinex illumination normalization on L channel |
 | `RETINEX_SIGMA` | 30 | SSR Gaussian blur radius |
-| `NORMALIZE_WHITE_BALANCE` | False | Gray-world white balance (disabled — can desaturate) |
+| `NORMALIZE_WHITE_BALANCE` | False | Gray-world white balance (disabled â€” can desaturate) |
 | `LAB_L_MIN` | 40 | Shadow removal threshold |
 | `LAB_L_MAX` | 230 | Highlight removal threshold |
 
@@ -198,14 +199,14 @@ calibrator.set_calibration_from_reference(
 ### Common reference values
 | Device | DPI | px/mm |
 |--------|-----|-------|
-| Modern smartphone | 300–450 | 11.8–17.7 |
-| Webcam (720p–1080p) | 72–100 | 2.8–3.9 |
-| High-res DSLR | 200–300 | 7.9–11.8 |
+| Modern smartphone | 300â€“450 | 11.8â€“17.7 |
+| Webcam (720pâ€“1080p) | 72â€“100 | 2.8â€“3.9 |
+| High-res DSLR | 200â€“300 | 7.9â€“11.8 |
 | Config default | 200 | 5.0 |
 
 ---
 
-## Real-time Analyzer — Key Algorithms
+## Real-time Analyzer â€” Key Algorithms
 
 ### Stable ratio policy
 `shape_ratio` always prefers nail-bed geometry when the free edge was confidently detected. When boundary detection fails it falls back to full-nail geometry, preventing measurement jumps between frames.
@@ -240,12 +241,12 @@ After pose stabilization, a CSRT tracker follows the nail between YOLO inference
 ## Troubleshooting
 
 ### No nails detected
-- Lower `REALTIME_DETECTION_CONFIDENCE` (try 0.5–0.6).
+- Lower `REALTIME_DETECTION_CONFIDENCE` (try 0.5â€“0.6).
 - Ensure the finger is flat, well-lit, and perpendicular to the camera.
 - Check `MIN_NAIL_ASPECT_RATIO` / `MAX_NAIL_ASPECT_RATIO` are not too strict.
 
 ### Same nail triggers "NEW NAIL DETECTED" repeatedly
-- Centroid jitter is exceeding the 40 px grid — keep the hand more still.
+- Centroid jitter is exceeding the 40 px grid â€” keep the hand more still.
 - Check `CENTROID_DISTANCE_THRESHOLD` (default 100 px).
 
 ### Measurements jump between frames
@@ -253,11 +254,11 @@ After pose stabilization, a CSRT tracker follows the nail between YOLO inference
 - Confirm `ENABLE_RETINEX = True` for consistent illumination.
 
 ### Nail-bed ratio > full-nail ratio
-- Should not occur — safety clamps are applied after every boundary step.
+- Should not occur â€” safety clamps are applied after every boundary step.
 - Check `boundary_methods_count`: a value of 0 means the anatomical prior triggered the full-nail fallback.
 
 ### Color returns None or nail is marked polished
-- Nail may be genuinely polished (`polished: True`) — color extraction is intentionally skipped.
+- Nail may be genuinely polished (`polished: True`) â€” color extraction is intentionally skipped.
 - If natural nails are wrongly classified, adjust `NAIL_LAB_*` color validation thresholds in `config.py`.
 
 ### Model not found
